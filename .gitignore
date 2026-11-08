@@ -1,0 +1,29 @@
+# Secrets and environment files
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local data and databases
+data/raw/
+*.db
+*.sqlite
+*.sqlite3
+
+# Local output and logs
+logs/
+reports/generated/
+*.log
+
+# Editor and system files
+.vscode/settings.json
+.DS_Store
+Thumbs.db
