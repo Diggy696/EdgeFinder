@@ -4,6 +4,7 @@
 - NFL first; future NBA, NCAAF, NCAAB, and Premier League support.
 - Research only. Never automatically place wagers.
 
+
 # ARCHITECTURE
 
 - Python application with provider-independent data adapters.
@@ -13,6 +14,7 @@
 - Keep sports-specific assumptions isolated from shared infrastructure.
 - Preserve source identity, historical timestamps, and data provenance in future designs.
 - Do not create probability estimates without defensible statistical methodology.
+- When archictecture needs a decision point and multiple options exist, research the options, present options to end user and let him/her make a decision with recommendations and pros/cons for each.
 
 # DEVELOPMENT RULES
 
