@@ -1,1 +1,1 @@
-# Dependencies will be chosen later.
+nflreadpy==0.1.5
