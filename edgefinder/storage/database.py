@@ -16,7 +16,7 @@ functions. Unsupported external connections fail closed on evidence writes.
 Publication evidence is a caller assertion, not independently authenticated.
 """
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime
 import hashlib
 import json
@@ -27,6 +27,7 @@ import sqlite3
 
 
 NORMALIZATION_VERSION = "edgefinder.normalized.v1"
+MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
 RECORD_FIELDS = (
     "namespace_id", "identifier", "game_namespace_id", "game_identifier",
     "team_namespace_id", "team_identifier", "home_namespace_id",
@@ -111,6 +112,13 @@ def _record_canonical(*values):
     return canonical(row)
 
 
+def _artifact_sha256(value):
+    """Hash bounded, exact retained bytes only; no decoding or I/O."""
+    if type(value) is not bytes or len(value) > MAX_ARTIFACT_BYTES:
+        raise ValueError("Expected at most 64 MiB of artifact bytes")
+    return hashlib.sha256(value).hexdigest()
+
+
 def connect(path=":memory:"):
     """Open only the explicitly chosen database (default: isolated memory)."""
     db = sqlite3.connect(path, isolation_level=None)
@@ -122,6 +130,7 @@ def connect(path=":memory:"):
     db.create_function("record_canonical", len(RECORD_FIELDS), _record_canonical,
                        deterministic=True)
     db.create_aggregate("evidence_hash", 1, _EvidenceHash)
+    db.create_function("artifact_sha256", 1, _artifact_sha256, deterministic=True)
     return db
 
 
@@ -139,17 +148,129 @@ def transaction(db):
         raise
 
 
-def initialize(db):
-    """Create the schema atomically in an empty database; no migration support."""
+def _installation_connection(db):
+    """Check the supported connection contract, not an authorization boundary."""
     if db.in_transaction:
-        raise RuntimeError("Initialize outside a transaction")
+        raise RuntimeError("Install outside a transaction")
+    if sqlite3.sqlite_version_info < (3, 37, 0):
+        raise RuntimeError("SQLite 3.37 or later is required for STRICT tables")
+    if db.row_factory is not sqlite3.Row or db.isolation_level is not None:
+        raise RuntimeError("Use an EdgeFinder connect() connection")
+    if (db.execute("PRAGMA foreign_keys").fetchone()[0] != 1 or
+            db.execute("PRAGMA recursive_triggers").fetchone()[0] != 1):
+        raise RuntimeError("Foreign keys and recursive triggers must be enabled")
+    required = {("valid_canonical", 1, "s"),
+                ("record_canonical", len(RECORD_FIELDS), "s"),
+                ("evidence_hash", 1, "a"), ("artifact_sha256", 1, "s")}
+    functions = {(r["name"], r["narg"], r["type"])
+                 for r in db.execute("PRAGMA function_list") if not r["builtin"]}
+    if not required <= functions:
+        raise RuntimeError("Required EdgeFinder SQL functions are missing")
+    # A removed Python callback can remain in function_list. Exercise each one.
+    values = [None] * len(RECORD_FIELDS)
+    values[-1] = canonical(None)
+    record = canonical(dict.fromkeys(RECORD_FIELDS))
     try:
-        db.executescript("BEGIN IMMEDIATE;\n" +
-                         Path(__file__).with_name("schema.sql").read_text(encoding="utf-8") +
-                         "\nCOMMIT;")
-    except BaseException:
-        db.rollback()
-        raise
+        valid = db.execute("SELECT valid_canonical(?),valid_canonical('{}'),"
+                           "artifact_sha256(?)", (record, b"")).fetchone()
+        normalized = db.execute(
+            "SELECT record_canonical(" + ",".join("?" for _ in values) + ")",
+            values).fetchone()[0]
+        digest = db.execute("SELECT evidence_hash(value) FROM "
+                            "(SELECT ? AS value UNION ALL SELECT ?)",
+                            (record, record)).fetchone()[0]
+    except sqlite3.Error as error:
+        raise RuntimeError("Required EdgeFinder SQL functions are unavailable") from error
+    if (tuple(valid) != (1, 0, hashlib.sha256(b"").hexdigest()) or
+            normalized != record or digest != evidence_hash([record, record])):
+        raise RuntimeError("Required EdgeFinder SQL functions are incompatible")
+
+
+def _execute_schema(db, sql):
+    """Execute bundled complete statements without executescript's commit."""
+    statement = ""
+    for line in sql.splitlines(keepends=True):
+        statement += line
+        if sqlite3.complete_statement(statement):
+            db.execute(statement)
+            statement = ""
+    if statement.strip():
+        raise RuntimeError("Incomplete bundled schema statement")
+
+
+def _schema_signature(db):
+    """Compare definitions and constraint structures, never rootpage IDs."""
+    objects = tuple(tuple(r) for r in db.execute(
+        "SELECT type,name,tbl_name,sql FROM main.sqlite_schema ORDER BY type,name"))
+    structures = []
+    for kind, name, _, _ in objects:
+        quoted = '"' + name.replace('"', '""') + '"'
+        if kind != "table":
+            continue
+        columns = tuple(tuple(r) for r in db.execute(f"PRAGMA main.table_xinfo({quoted})"))
+        indexes = []
+        # WITHOUT ROWID primary indexes need not have sqlite_schema rows.
+        for index in db.execute(f"PRAGMA main.index_list({quoted})"):
+            index_name = '"' + index["name"].replace('"', '""') + '"'
+            info = tuple(tuple(r) for r in db.execute(f"PRAGMA main.index_xinfo({index_name})"))
+            indexes.append((index["name"], index["unique"], index["origin"], index["partial"], info))
+        structures.append((name, columns, tuple(sorted(indexes))))
+    return objects, tuple(structures)
+
+
+def _install_provenance(db, *, fresh):
+    """The only supported transition is exact legacy v0 -> exact extended v1."""
+    _installation_connection(db)
+    with transaction(db):
+        # Reject shadow tables and attached application databases rather than
+        # inspecting main but accidentally operating on another schema.
+        if (db.execute("SELECT 1 FROM temp.sqlite_schema LIMIT 1").fetchone() or
+                any(r[1] not in ("main", "temp")
+                    for r in db.execute("PRAGMA database_list"))):
+            raise RuntimeError("Install on an isolated main database")
+        baseline = Path(__file__).with_name("schema.sql").read_text(encoding="utf-8")
+        extension = Path(__file__).with_name("provenance_schema.sql").read_text(encoding="utf-8")
+        # The same SQLite runtime generates expected automatic constraint indexes.
+        # No cached manifest, SQL-equivalence parser, or schema repairs are used.
+        with closing(connect()) as reference:
+            _execute_schema(reference, baseline)
+            legacy = _schema_signature(reference)
+            _execute_schema(reference, extension)
+            installed = _schema_signature(reference)
+        version = db.execute("PRAGMA main.user_version").fetchone()[0]
+        actual = _schema_signature(db)
+        if fresh:
+            if version != 0 or actual != ((), ()):
+                raise RuntimeError("Initialize requires an empty version 0 database")
+            _execute_schema(db, baseline)
+        elif version == 1 and actual == installed:
+            if db.execute("PRAGMA main.foreign_key_check").fetchone():
+                raise RuntimeError("Existing foreign-key integrity check failed")
+            return
+        elif version != 0 or actual != legacy:
+            raise RuntimeError("Unrecognized database version or schema")
+        if db.execute("PRAGMA main.foreign_key_check").fetchone():
+            raise RuntimeError("Existing foreign-key integrity check failed")
+        _execute_schema(db, extension)
+        if _schema_signature(db) != installed:
+            raise RuntimeError("Installed provenance schema does not match")
+        if db.execute("PRAGMA main.foreign_key_check").fetchone():
+            raise RuntimeError("Installed foreign-key integrity check failed")
+        db.execute("PRAGMA main.user_version=1")
+
+
+def initialize(db):
+    """Atomically install baseline and synthetic provenance in an empty database."""
+    _install_provenance(db, fresh=True)
+
+
+def install_provenance(db):
+    """Explicit additive legacy upgrade, or a structurally validated v1 no-op.
+
+    Unknown/partial schemas are rejected. No legacy evidence is backfilled or
+    amended; committed provenance has no destructive downgrade operation.
+    """
+    _install_provenance(db, fresh=False)
 
 
 def _validate_metadata(provider, role, loader_scope, retrieved_at,
