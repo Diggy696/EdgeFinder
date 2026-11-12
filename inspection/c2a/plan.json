@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "mode": "offline_only",
+  "artifacts": [
+    {"artifact_id": "schedules", "release": "schedules", "filename": "games.csv.gz", "role": "schedule", "season": null},
+    {"artifact_id": "stats_2025", "release": "stats_player", "filename": "stats_player_week_2025.csv.gz", "role": "stats", "season": 2025},
+    {"artifact_id": "stats_2026", "release": "stats_player", "filename": "stats_player_week_2026.csv.gz", "role": "stats", "season": 2026},
+    {"artifact_id": "rosters_2025", "release": "weekly_rosters", "filename": "roster_weekly_2025.csv.gz", "role": "roster", "season": 2025},
+    {"artifact_id": "rosters_2026", "release": "weekly_rosters", "filename": "roster_weekly_2026.csv.gz", "role": "roster", "season": 2026},
+    {"artifact_id": "players", "release": "players", "filename": "players.csv.gz", "role": "players", "season": null}
+  ],
+  "source_url_template": "https://github.com/nflverse/nflverse-data/releases/download/{release}/{filename}",
+  "analysis_windows": {"2025": {"phase": "REG", "weeks": [1, 18]}, "2026": {"phase": "REG", "weeks": [7, 9]}},
+  "freshness": {
+    "season": 2026,
+    "scope": "all_observed_regular_season_weeks_separate_from_analysis_windows",
+    "reference_time": "explicit_as_of_required_never_local_clock",
+    "completion_rule": "valid_nonnegative_home_and_away_scores_and_verified_not_future_game_time",
+    "publication_evidence": "unknown_unless_supplied_never_inferred_from_coverage"
+  },
+  "limits": {
+    "compressed_schedule": 2097152,
+    "compressed_stats": 4194304,
+    "compressed_roster": 4194304,
+    "compressed_players": 8388608,
+    "compressed_total": 16777216,
+    "decompressed_file": 67108864,
+    "decompressed_total": 268435456,
+    "columns": 512,
+    "field_bytes": 16384,
+    "record_bytes": 262144,
+    "rows_schedule": 25000,
+    "rows_stats": 50000,
+    "rows_roster": 100000,
+    "rows_players": 100000,
+    "rows_total": 425000,
+    "retained_bytes": 134217728
+  },
+  "csv_rules": {
+    "encoding": "utf-8-sig_strict",
+    "delimiter": ",",
+    "null_tokens": ["", "NA", "NULL"],
+    "identifier_policy": "original_strings_no_coercion_or_name_matching",
+    "numeric_policy": "season_week_decimal_digits_counts_and_yards_finite_integer_valued_decimal_absolute_max_1000000",
+    "phase_policy": "REG_regular_PRE_preseason_POST_WC_DIV_CON_SB_postseason"
+  },
+  "historical_policy": "retrospective_only_pregame_knowability_not_established",
+  "limitations": ["CSV_has_no_Parquet_physical_types", "nflreadpy_Arrow_Polars_not_exercised", "real_provider_completeness_unverified", "retained_content_accounting_is_not_a_process_memory_limit", "live_acquisition_not_implemented"]
+}
