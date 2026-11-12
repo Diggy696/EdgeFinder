@@ -12,6 +12,11 @@ provide an OS sandbox against concurrent malicious filesystem replacement.
 Deadlines rely on normal OS scheduling/process termination, not real-time OS
 guarantees. Cleanup and atomic publication are local supervisor filesystem work.
 
+Failure JSON distinguishes the last validated phase START announcement from
+the attempted operation, identifies worker/supervisor attribution, and reports
+the worker exit status when available. A phase announcement is not completion.
+Abrupt exits may leave the worker's exact attempted operation unknown.
+
 HTTPS identifies the hosting service; SHA-256 binds the saved compressed bytes
 to GitHub's metadata. Neither authenticates NFL facts nor proves pregame access.
 This module does not decompress, inspect CSVs, use SQLite, or place wagers.
@@ -19,6 +24,7 @@ This module does not decompress, inspect CSVs, use SQLite, or place wagers.
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
@@ -74,6 +80,36 @@ OWNED_NAMES = tuple(a[2] for a in ARTIFACTS) + ("manifest.json", "receipt.json")
 QUERY_KEYS = frozenset(("sp", "sv", "sr", "spr", "se", "rscd", "rsct",
                         "skoid", "sktid", "skt", "ske", "sks", "skv", "sig",
                         "jwt", "response-content-disposition", "response-content-type"))
+# Diagnostic values are constants, never exception text or response values.
+FAILURE_CODES = frozenset((
+    "acquisition_failed", "artifact_identity", "asset_identity", "asset_metadata", "byte_limit",
+    "cleanup_failure", "deadline_exceeded", "deadline_policy", "destination_exists",
+    "destination_policy", "destination_unavailable", "dns_policy", "duplicate_json_key",
+    "endpoint_policy", "file_changed", "file_policy", "file_write", "header_limit",
+    "integrity_mismatch", "json_limit", "length_mismatch", "localappdata_policy",
+    "manifest_identity", "metadata_changed", "metadata_digest", "metadata_identity",
+    "metadata_json", "peer_mismatch", "python_runtime", "redirect_policy", "redirect_query",
+    "release_identity", "reparse_path", "response_encoding", "response_headers",
+    "response_length", "response_protocol", "response_status", "stage_inventory",
+    "stream_failure", "supervisor_failure", "supervisor_required", "timestamp",
+    "tls_environment", "tls_policy", "transport_failure", "windows_required",
+    "worker_failed", "worker_pid", "worker_protocol", "worker_exit", "unexpected_exception",
+))
+WORKER_OPERATIONS = frozenset((
+    "worker_handshake", "destination_validation", "staging_prepare", "metadata_collection",
+    "endpoint_validation", "dns_resolution", "dns_validation", "socket_connect",
+    "peer_validation", "tls_context", "tls_handshake", "http_request", "http_headers",
+    "header_validation", "redirect_validation", "response_validation", "response_read",
+    "response_store", "response_close", "metadata_parse", "metadata_validation",
+    "timestamp_recording", "artifact_download", "artifact_write", "artifact_flush",
+    "artifact_verification", "metadata_comparison", "receipt_write", "manifest_write",
+    "final_verification", "worker_exit", "unknown",
+))
+SUPERVISOR_OPERATIONS = frozenset((
+    "destination_validation", "runtime_validation", "worker_start", "worker_handshake",
+    "worker_wait", "worker_exit", "publication_validation", "publication", "unknown",
+))
+_ATTEMPTED_OPERATION = ContextVar("c2a_attempted_operation", default=None)
 
 
 class Failure(Exception):
@@ -82,12 +118,71 @@ class Failure(Exception):
     def __init__(self, code):
         self.code = code
         self.cleanup_failed = False
+        self.failure_code = None
+        self.last_validated_phase = None
+        self.attempted_operation = None
+        self.operation_source = None
+        self.worker_exit_status = None
         super().__init__(code)
 
 
 def _require(condition, code):
     if not condition:
         raise Failure(code)
+
+
+def _attempt(operation):
+    _require(operation in WORKER_OPERATIONS, "worker_protocol")
+    _ATTEMPTED_OPERATION.set(operation)
+
+
+def _safe_code(code):
+    return code if type(code) is str and code in FAILURE_CODES else "unexpected_exception"
+
+
+def _worker_failure(error):
+    """One bounded JSON failure record. No formatting of the exception itself."""
+    known = isinstance(error, Failure)
+    operation = error.attempted_operation if known else None
+    if operation is None:
+        operation = _ATTEMPTED_OPERATION.get()
+    record = dict(type="failure", code=_safe_code(error.code if known else None),
+                  operation=operation if type(operation) is str and operation in WORKER_OPERATIONS else "unknown",
+                  cleanup_failed=known and (error.cleanup_failed is True or error.code == "cleanup_failure"))
+    body = _json_bytes(record)
+    _require(len(body)+2 <= 128, "worker_protocol")  # Includes Windows CRLF.
+    return body.decode("ascii")
+
+
+def _read_worker_failure(line):
+    _require(type(line) is bytes and len(line) <= 128 and line.endswith(b"\n"), "worker_protocol")
+    try:
+        value = _parse_json(line)
+    except Exception:
+        raise Failure("worker_protocol") from None
+    _require(type(value) is dict and set(value) == {"type", "code", "operation", "cleanup_failed"}
+             and value["type"] == "failure" and type(value["code"]) is str
+             and value["code"] in FAILURE_CODES and type(value["operation"]) is str
+             and value["operation"] in WORKER_OPERATIONS and type(value["cleanup_failed"]) is bool,
+             "worker_protocol")
+    return value
+
+
+def _failure_json(error):
+    """Final CLI diagnostics have a closed vocabulary, even for internal callers."""
+    known = isinstance(error, Failure)
+    code = _safe_code(error.code if known else None)
+    phase = error.last_validated_phase if known else None
+    operation = error.attempted_operation if known else None
+    source = error.operation_source if known else None
+    status = error.worker_exit_status if known else None
+    return dict(error=code, failure_code=_safe_code(error.failure_code or code) if known else code,
+                last_validated_phase=phase if type(phase) is str and phase in PHASES else None,
+                attempted_operation=operation if type(operation) is str and operation in
+                WORKER_OPERATIONS | SUPERVISOR_OPERATIONS else None,
+                operation_source=source if source in ("worker", "supervisor") else None,
+                worker_exit_status=status if type(status) is int and -(2**31) <= status < 2**32 else None,
+                cleanup_failed=known and error.cleanup_failed is True)
 
 
 def _load_contracts():
@@ -264,9 +359,12 @@ def _open(endpoint):
     """One request, no proxies/auth/redirects, standard-library TLS validation."""
     raw = tls = response = None
     try:
+        _attempt("endpoint_validation")
         _approved_endpoint(endpoint)
+        _attempt("dns_resolution")
         records = socket.getaddrinfo(endpoint.host, 443, type=socket.SOCK_STREAM,
                                      proto=socket.IPPROTO_TCP)
+        _attempt("dns_validation")
         _require(0 < len(records) <= 64, "dns_policy")
         answers = []
         for family, kind, protocol, _, address in records:
@@ -277,14 +375,20 @@ def _open(endpoint):
         plan = _connection_plan(endpoint, tuple(answers))
         selected = ip_address(plan.selected_address)
         family = socket.AF_INET if selected.version == 4 else socket.AF_INET6
+        _attempt("socket_connect")
         raw = socket.socket(family, socket.SOCK_STREAM, socket.IPPROTO_TCP)
         raw.settimeout(IO_SECONDS)
         address = (str(selected), 443) if selected.version == 4 else (str(selected), 443, 0, 0)
         raw.connect(address)  # Numeric sockaddr; socket.create_connection would re-resolve.
+        _attempt("peer_validation")
         _require(ip_address(raw.getpeername()[0]) == selected and raw.getpeername()[1] == 443,
                  "peer_mismatch")
-        tls = _tls_context().wrap_socket(raw, server_hostname=plan.tls_hostname)
+        _attempt("tls_context")
+        context = _tls_context()
+        _attempt("tls_handshake")
+        tls = context.wrap_socket(raw, server_hostname=plan.tls_hostname)
         raw = None  # SSL socket now owns the descriptor.
+        _attempt("peer_validation")
         _require(ip_address(tls.getpeername()[0]) == selected and tls.getpeername()[1] == 443,
                  "peer_mismatch")
         tls.settimeout(IO_SECONDS)
@@ -292,7 +396,9 @@ def _open(endpoint):
         request = ("GET "+endpoint.target+" HTTP/1.1\r\nHost: "+endpoint.host
                    +"\r\nUser-Agent: EdgeFinder-C2a\r\nAccept: "+accept
                    +"\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n")
+        _attempt("http_request")
         tls.sendall(request.encode("ascii"))
+        _attempt("http_headers")
         response = _Response(_HeaderSocket(tls), method="GET")
         response.begin()
         return _LiveResponse(response, tls)
@@ -306,6 +412,7 @@ def _open(endpoint):
                     failed_close = True
         failure = error if isinstance(error, Failure) else Failure("transport_failure")
         failure.cleanup_failed |= failed_close
+        failure.attempted_operation = _ATTEMPTED_OPERATION.get()
         raise failure from None
 
 
@@ -336,14 +443,18 @@ def _receive(endpoint, cap, sink, request, *, aid=None, expected=None):
         response = None
         primary = None
         try:
+            _attempt("http_request")
             response = request(current)
+            _attempt("header_validation")
             headers = _headers(response)
             if response.status == 302:
+                _attempt("redirect_validation")
                 _require(aid is not None and not redirected and current == _artifact_endpoint(aid)
                          and len(headers.get("location", [])) == 1, "redirect_policy")
                 current = _cdn_endpoint(headers["location"][0], aid)
                 redirected = True
                 continue
+            _attempt("response_validation")
             _require(response.status == 200 and "location" not in headers, "response_status")
             length_text = headers.get("content-length", [])
             _require(len(length_text) == 1 and re.fullmatch(r"0|[1-9][0-9]{0,9}", length_text[0]),
@@ -354,6 +465,7 @@ def _receive(endpoint, cap, sink, request, *, aid=None, expected=None):
             used, digest = 0, hashlib.sha256()
             while True:
                 count = min(CHUNK, cap-used+1)
+                _attempt("response_read")
                 chunk = response.read(count)
                 _require(type(chunk) is bytes and len(chunk) <= count, "response_protocol")
                 if not chunk:
@@ -361,22 +473,30 @@ def _receive(endpoint, cap, sink, request, *, aid=None, expected=None):
                 used += len(chunk)
                 _require(used <= cap, "byte_limit")
                 _require(used <= length, "length_mismatch")
+                _attempt("response_store")
                 sink(chunk)
                 digest.update(chunk)
             _require(used == length, "length_mismatch")
             return used, digest.hexdigest()
         except BaseException as error:
             primary = error if isinstance(error, Failure) else Failure("stream_failure")
+            if primary.attempted_operation is None:
+                primary.attempted_operation = _ATTEMPTED_OPERATION.get()
             raise primary from None
         finally:
             if response is not None:
                 try:
+                    if primary is None:
+                        _attempt("response_close")
                     response.close()
                 except Exception:
                     if isinstance(primary, Failure):
                         primary.cleanup_failed = True
                     elif primary is None:
-                        raise Failure("cleanup_failure") from None
+                        failure = Failure("cleanup_failure")
+                        failure.cleanup_failed = True
+                        failure.attempted_operation = "response_close"
+                        raise failure from None
 
 
 def _json_bytes(value):
@@ -551,34 +671,45 @@ def _batch(stage, request, progress, *, utc=_utc):
 
     def metadata(tag):
         nonlocal metadata_used
+        _attempt("metadata_collection")
         body = bytearray()
         used, _ = _receive(_metadata_endpoint(tag), min(METADATA_FILE, METADATA_TOTAL-metadata_used),
                            body.extend, request)
         metadata_used += used
-        result = _release(tag, _parse_json(body))
+        _attempt("metadata_parse")
+        value = _parse_json(body)
+        _attempt("metadata_validation")
+        result = _release(tag, value)
+        _attempt("timestamp_recording")
         observations.append(dict(tag=tag, observed_at=_timestamp(utc())))
         return result
 
     for tag in TAGS:
         progress("before:"+tag)
         before.update(metadata(tag))
+    _attempt("metadata_validation")
     _require(sum(a["size"] for a in before.values()) <= DATA_TOTAL, "byte_limit")
     _require(len({a["asset_id"] for a in before.values()}) == 6, "asset_identity")
     entries, total = [], 0
     for aid, tag, filename, cap in ARTIFACTS:
         progress("artifact:"+aid)
+        _attempt("artifact_download")
         expected = before[aid]
         path = stage/filename
+        _attempt("artifact_write")
         with path.open("xb") as output:
             def save(chunk):
                 _require(output.write(chunk) == len(chunk), "file_write")
             transferred = _receive(_artifact_endpoint(aid), min(cap, DATA_TOTAL-total), save,
                                    request, aid=aid, expected=expected["size"])
+            _attempt("artifact_flush")
             output.flush()
             os.fsync(output.fileno())
+        _attempt("artifact_verification")
         reread = _hash_file(path, cap)
         _require(transferred == reread == (expected["size"], expected["sha256"]), "integrity_mismatch")
         total += transferred[0]
+        _attempt("timestamp_recording")
         entries.append(dict(artifact_id=aid, release=tag, filename=filename,
                             byte_length=reread[0], sha256=reread[1],
                             hosting_release_at=expected["release_published_at"],
@@ -588,8 +719,10 @@ def _batch(stage, request, progress, *, utc=_utc):
     for tag in TAGS:
         progress("after:"+tag)
         after.update(metadata(tag))
+    _attempt("metadata_comparison")
     _require(before == after, "metadata_changed")
     progress("verify")
+    _attempt("timestamp_recording")
     manifest = dict(artifacts=entries, verification_evidence=
                     "Compressed lengths and SHA-256 matched GitHub metadata before and after acquisition; "
                     "hosting evidence only; historical pregame availability not established.")
@@ -597,8 +730,11 @@ def _batch(stage, request, progress, *, utc=_utc):
                    canonical_sources={a: BASE+t+"/"+n for a, t, n, _ in ARTIFACTS},
                    provider_publication_evidence=None, historical_availability="not_established",
                    inspection_performed=False, completed_at=_timestamp(utc()))
+    _attempt("receipt_write")
     _write_json(stage/"receipt.json", receipt)
+    _attempt("manifest_write")
     _write_json(stage/"manifest.json", manifest)
+    _attempt("final_verification")
     _verify_stage(stage, manifest)
 
 
@@ -655,6 +791,8 @@ def _supervise(command, final, *, environment, batch_seconds=BATCH_SECONDS,
     process = None
     owned = False
     pid_verified = False
+    reported_failure = None
+    supervisor_operation = "worker_start"
     reader = None
     events = queue.Queue(maxsize=32)
     start = time.monotonic()
@@ -684,6 +822,7 @@ def _supervise(command, final, *, environment, batch_seconds=BATCH_SECONDS,
         process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    stderr=subprocess.DEVNULL, env=environment, shell=False,
                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        supervisor_operation = "worker_handshake"
         reader = threading.Thread(target=read_events, daemon=True)
         reader.start()
         while True:
@@ -700,13 +839,18 @@ def _supervise(command, final, *, environment, batch_seconds=BATCH_SECONDS,
                 process.stdin.write(b"go\n")
                 process.stdin.flush()
                 process.stdin.close()
+                supervisor_operation = "worker_wait"
+            elif reported_failure is not None:
+                # Exactly one terminal failure record, then EOF. Wait within
+                # the existing deadline for the real exit status; never publish.
+                _require(not line, "worker_protocol")
+                break
             elif line == b"owned\n":
                 _require(phase_index == 1 and not owned, "worker_protocol")
                 owned = True
-            elif line in (b"failed\n", b"failed_cleanup\n"):
-                failure = Failure("worker_failed")
-                failure.cleanup_failed = line == b"failed_cleanup\n"
-                raise failure
+            elif line.startswith(b"{"):
+                _require(not ready, "worker_protocol")
+                reported_failure = _read_worker_failure(line)
             elif not line:
                 break
             else:
@@ -718,19 +862,37 @@ def _supervise(command, final, *, environment, batch_seconds=BATCH_SECONDS,
                 allowance = (METADATA_SECONDS if expected == "prepare" else
                              (phase_seconds or _phase_timeout(expected)))
                 phase_deadline = min(deadline, time.monotonic()+allowance)
+        supervisor_operation = "worker_exit"
         returncode = process.wait(timeout=max(0.001, min(deadline, phase_deadline)-time.monotonic()))
-        _require(returncode == 0 and ready and owned and phase_index == len(PHASES), "worker_failed")
+        _require(reported_failure is None and returncode == 0 and ready and owned
+                 and phase_index == len(PHASES), "worker_failed")
         _require(time.monotonic() < min(deadline, phase_deadline), "deadline_exceeded")
+        supervisor_operation = "publication_validation"
         _path(stage)
         _path(final, missing=True)
         _require(not final.exists(), "destination_exists")
         _require(time.monotonic() < min(deadline, phase_deadline), "deadline_exceeded")
         # Windows rename fails if final exists, including an empty directory.
+        supervisor_operation = "publication"
         stage.rename(final)
         return final
     except BaseException as error:
         failure = (error if isinstance(error, Failure) else Failure(
             "deadline_exceeded" if isinstance(error, subprocess.TimeoutExpired) else "supervisor_failure"))
+        # A validated phase is an accepted START announcement, not evidence
+        # that its operation completed. Only "ready" attests worker readiness.
+        failure.last_validated_phase = PHASES[phase_index-1] if phase_index else None
+        failure.failure_code = _safe_code(failure.code)
+        failure.attempted_operation = supervisor_operation
+        failure.operation_source = "supervisor"
+        if reported_failure is not None:
+            failure.cleanup_failed |= reported_failure["cleanup_failed"]
+            if failure.code in ("worker_failed", "deadline_exceeded"):
+                failure.failure_code = reported_failure["code"]
+                failure.attempted_operation = reported_failure["operation"]
+                failure.operation_source = "worker"
+        elif failure.code == "worker_failed":
+            failure.failure_code = "worker_exit"
         stopped = True
         if process is not None and process.poll() is None:
             try:
@@ -742,6 +904,8 @@ def _supervise(command, final, *, environment, batch_seconds=BATCH_SECONDS,
             failure.cleanup_failed = True  # Never clean while the child may still write.
         elif owned:
             failure.cleanup_failed |= _cleanup(stage)
+        if process is not None:
+            failure.worker_exit_status = process.poll()
         raise failure from None
     finally:
         if reader is not None:
@@ -754,19 +918,25 @@ def _supervise(command, final, *, environment, batch_seconds=BATCH_SECONDS,
 def _worker_main():
     def progress(phase):
         print(phase, flush=True)
+    token = _ATTEMPTED_OPERATION.set("worker_handshake")
     try:
         progress("pid:"+str(os.getpid()))
         _require(sys.stdin.buffer.readline(4) == b"go\n", "supervisor_required")
         progress("prepare")
-        stage = _prepare(_destination())
+        _attempt("destination_validation")
+        final = _destination()
+        _attempt("staging_prepare")
+        stage = _prepare(final)
         progress("owned")
         _batch(stage, _open, progress)
         progress("ready")
+        _attempt("worker_exit")
         return 0
     except BaseException as error:
-        print("failed_cleanup" if isinstance(error, Failure) and error.cleanup_failed else "failed",
-              flush=True)
+        print(_worker_failure(error), flush=True)
         return 2  # Parent reports only a constant failure code; no traceback.
+    finally:
+        _ATTEMPTED_OPERATION.reset(token)
 
 
 def main(argv=None):
@@ -776,16 +946,21 @@ def main(argv=None):
     if args != ["acquire"]:
         print('{"error":"explicit_acquire_command_required"}', file=sys.stderr)
         return 2
+    operation = "destination_validation"
     try:
         final = _destination()
+        operation = "runtime_validation"
         command = [_worker_executable(), "-I", "-S", "-B", str(HERE/"acquire.py"), "--worker"]
+        operation = "worker_start"
         _supervise(command, final, environment=_worker_environment())
         print('{"status":"acquired_and_verified","historical_availability":"not_established"}')
         return 0
     except BaseException as error:
         failure = error if isinstance(error, Failure) else Failure("acquisition_failed")
-        print(_json_bytes(dict(error=failure.code, cleanup_failed=failure.cleanup_failed)).decode("ascii"),
-              file=sys.stderr)
+        if failure.attempted_operation is None:
+            failure.attempted_operation = operation
+            failure.operation_source = "supervisor"
+        print(_json_bytes(_failure_json(failure)).decode("ascii"), file=sys.stderr)
         return 2
 
 

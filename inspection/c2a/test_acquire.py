@@ -177,6 +177,8 @@ class Backend:
 
 class Cases(unittest.TestCase):
     def setUp(self):
+        token = acquire._ATTEMPTED_OPERATION.set(None)
+        self.addCleanup(acquire._ATTEMPTED_OPERATION.reset, token)
         self.temporary = tempfile.TemporaryDirectory(prefix="case-", dir=TEST_ROOT)
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
@@ -433,7 +435,9 @@ class TransferTests(Cases):
         failure = self.failure("test_stream", self.receive, response)
         self.assertTrue(failure.cleanup_failed)
         self.assertEqual(response.closed, 1)
-        self.failure("cleanup_failure", self.receive, FakeResponse(close_error=OSError(SECRET)))
+        failure = self.failure("cleanup_failure", self.receive, FakeResponse(close_error=OSError(SECRET)))
+        self.assertTrue(failure.cleanup_failed)
+        self.assertEqual(failure.attempted_operation, "response_close")
 
     def test_dependency_stream_and_close_failure_are_both_sanitized(self):
         response = FakeResponse(b"x", read_error=OSError(SECRET), close_error=OSError(SECRET))
@@ -671,7 +675,9 @@ class FilesystemAndSupervisorTests(Cases):
         self.assertFalse(self.final.exists())
 
     def test_unverified_worker_pid_gets_no_permission_to_start(self):
-        self.failure("worker_pid", self.child, "wrong_pid")
+        failure = self.failure("worker_pid", self.child, "wrong_pid")
+        self.assertIsNone(failure.last_validated_phase)
+        self.assertEqual(failure.attempted_operation, "worker_handshake")
         self.assertFalse(self.final.exists())
         self.assertFalse(self.final.with_name("run-001.incomplete").exists())
 
@@ -711,6 +717,251 @@ class FilesystemAndSupervisorTests(Cases):
         self.assertNotIn(SECRET, stderr.getvalue())
 
 
+class DiagnosticProtocolTests(Cases):
+    def test_every_allowlisted_code_round_trips_without_exception_text(self):
+        acquire._attempt("metadata_validation")
+        for code in sorted(acquire.FAILURE_CODES):
+            with self.subTest(code=code):
+                error = acquire.Failure(code)
+                error.args = (SECRET,)
+                wire = acquire._worker_failure(error)
+                self.assertLessEqual(len(wire.encode("ascii"))+2, 128)
+                record = acquire._read_worker_failure((wire+"\n").encode("ascii"))
+                self.assertEqual(record["code"], code)
+                self.assertEqual(record["operation"], "metadata_validation")
+                self.assertEqual(record["cleanup_failed"], code == "cleanup_failure")
+                self.assertNotIn(SECRET, wire)
+
+    def test_unknown_exception_and_unknown_failure_code_use_fixed_fallback(self):
+        for error in (OSError(SECRET), RuntimeError(location()), acquire.Failure(SECRET)):
+            wire = acquire._worker_failure(error)
+            record = acquire._read_worker_failure((wire+"\n").encode("ascii"))
+            self.assertEqual(record["code"], "unexpected_exception")
+            self.assertEqual(record["operation"], "unknown")
+            self.assertNotIn(SECRET, wire)
+            self.assertNotIn("https:", wire)
+
+    def test_unknown_operation_is_sanitized_before_transmission(self):
+        error = acquire.Failure("byte_limit")
+        error.attempted_operation = SECRET
+        self.assertEqual(json.loads(acquire._worker_failure(error))["operation"], "unknown")
+
+    def test_malformed_failure_records_are_rejected(self):
+        valid = json.loads(acquire._worker_failure(acquire.Failure("byte_limit")))
+        cases = [b"{broken\n", b"{}\n", b"[]\n", b'{"a":NaN}\n',
+                 b'{"type":"failure","type":"failure"}\n', b"\xff\n"]
+        for key, value in (("type", "other"), ("code", SECRET), ("operation", SECRET),
+                           ("cleanup_failed", 1), ("code", ["byte_limit"]), ("operation", None)):
+            record = dict(valid)
+            record[key] = value
+            cases.append(acquire._json_bytes(record)+b"\n")
+        extra = dict(valid, url=SECRET)
+        cases.extend((acquire._json_bytes(extra)+b"\n", b"{"+b"x"*128+b"\n",
+                      acquire._json_bytes(valid)))
+        for body in cases:
+            self.failure("worker_protocol", acquire._read_worker_failure, body)
+
+    def test_final_json_has_no_arbitrary_exception_attributes(self):
+        error = acquire.Failure(SECRET)
+        error.failure_code = SECRET
+        error.last_validated_phase = SECRET
+        error.attempted_operation = SECRET
+        error.operation_source = SECRET
+        error.worker_exit_status = SECRET
+        error.cleanup_failed = SECRET
+        output = acquire._failure_json(error)
+        self.assertEqual(output["error"], "unexpected_exception")
+        self.assertEqual(output["failure_code"], "unexpected_exception")
+        for key in ("last_validated_phase", "attempted_operation", "operation_source", "worker_exit_status"):
+            self.assertIsNone(output[key])
+        self.assertFalse(output["cleanup_failed"])
+        self.assertNotIn(SECRET, acquire._json_bytes(output).decode("ascii"))
+
+    def test_primary_failure_operation_survives_response_cleanup(self):
+        error = self.failure("stream_failure", acquire._receive,
+                             acquire._metadata_endpoint("schedules"), 10, lambda _: None,
+                             lambda _: FakeResponse(b"x", read_error=OSError(SECRET),
+                                                    close_error=OSError(SECRET)))
+        record = json.loads(acquire._worker_failure(error))
+        self.assertEqual(record["operation"], "response_read")
+        self.assertEqual(record["code"], "stream_failure")
+        self.assertTrue(record["cleanup_failed"])
+
+    def test_nested_transport_failure_preserves_dns_operation(self):
+        with patch.object(acquire.socket, "getaddrinfo", side_effect=OSError(SECRET)):
+            error = self.failure("transport_failure", acquire._receive,
+                                 acquire._metadata_endpoint("schedules"), 10, lambda _: None, acquire._open)
+        self.assertEqual(error.attempted_operation, "dns_resolution")
+        self.assertNotIn(SECRET, acquire._worker_failure(error))
+
+
+class SupervisorDiagnosticTests(Cases):
+    def diagnostic(self, mode, code, phase, operation, *, cleanup=False):
+        failure = self.failure("worker_failed", self.child, "diagnostic:"+mode)
+        output = acquire._failure_json(failure)
+        self.assertEqual(output["failure_code"], code)
+        self.assertEqual(output["last_validated_phase"], phase)
+        self.assertEqual(output["attempted_operation"], operation)
+        self.assertEqual(output["operation_source"], "worker")
+        self.assertEqual(output["worker_exit_status"], 2)
+        self.assertEqual(output["cleanup_failed"], cleanup)
+        self.assertNotIn(SECRET, acquire._json_bytes(output).decode("ascii"))
+        self.assertFalse(self.final.exists())
+        self.assertFalse(self.final.with_name("run-001.incomplete").exists())
+        return failure
+
+    def test_failure_before_first_phase_has_no_validated_phase(self):
+        self.diagnostic("before_phase", "unexpected_exception", None, "worker_handshake")
+
+    def test_staging_failure_is_an_attempt_not_completed_prepare(self):
+        self.diagnostic("prepare", "reparse_path", "prepare", "staging_prepare")
+
+    def test_metadata_failure_reports_phase_and_header_operation(self):
+        self.diagnostic("metadata", "response_encoding", "before:schedules", "header_validation")
+
+    def test_artifact_failure_reports_specific_artifact_and_operation(self):
+        self.diagnostic("artifact", "stream_failure", "artifact:schedules", "response_read")
+
+    def test_final_verification_failure_does_not_report_ready(self):
+        self.diagnostic("verification", "integrity_mismatch", "verify", "final_verification")
+
+    def test_unknown_dependency_exception_is_sanitized_in_actual_worker_handler(self):
+        self.diagnostic("unknown", "unexpected_exception", "prepare", "staging_prepare")
+
+    def test_unknown_failure_code_is_sanitized_in_actual_worker_handler(self):
+        self.diagnostic("unknown_code", "unexpected_exception", "prepare", "staging_prepare")
+
+    def test_primary_response_close_failure_reaches_final_json(self):
+        self.diagnostic("close_primary", "cleanup_failure", "before:schedules", "response_close", cleanup=True)
+
+    def test_primary_read_failure_plus_close_failure_preserves_both(self):
+        self.diagnostic("close_secondary", "byte_limit", "before:schedules", "response_read", cleanup=True)
+
+    def test_malformed_oversized_duplicate_and_unexpected_messages_never_publish(self):
+        for mode in ("malformed", "oversized", "unterminated", "duplicate_failure", "duplicate_phase",
+                     "after_failure", "unknown_code", "extra_field", "duplicate_key", "failure_after_ready"):
+            with self.subTest(mode=mode):
+                with redirect_stdout(io.StringIO()) as stdout, redirect_stderr(io.StringIO()) as stderr:
+                    failure = self.failure("worker_protocol", self.child, "protocol:"+mode)
+                self.assertEqual(failure.last_validated_phase,
+                                 "ready" if mode == "failure_after_ready" else "prepare")
+                self.assertEqual(failure.failure_code, "worker_protocol")
+                self.assertEqual(failure.operation_source, "supervisor")
+                self.assertNotIn(SECRET, stdout.getvalue()+stderr.getvalue()+
+                                 acquire._json_bytes(acquire._failure_json(failure)).decode("ascii"))
+                self.assertFalse(self.final.exists())
+                self.assertFalse(self.final.with_name("run-001.incomplete").exists())
+
+    def test_abrupt_worker_exit_retains_real_exit_status(self):
+        failure = self.failure("worker_failed", self.child, "exit_seven")
+        self.assertEqual(failure.worker_exit_status, 7)
+        self.assertEqual(failure.failure_code, "worker_exit")
+        self.assertEqual(failure.last_validated_phase, "prepare")
+        self.assertFalse(self.final.exists())
+
+    def test_failure_record_with_zero_exit_status_still_cannot_publish(self):
+        failure = self.failure("worker_failed", self.child, "failure_exit_zero")
+        self.assertEqual(failure.worker_exit_status, 0)
+        self.assertEqual(failure.failure_code, "byte_limit")
+        self.assertFalse(self.final.exists())
+
+    def test_failure_record_cannot_extend_existing_deadline(self):
+        start = time.monotonic()
+        failure = self.failure("deadline_exceeded", self.child, "failure_hang", phase=0.8)
+        self.assertLess(time.monotonic()-start, 6)
+        self.assertEqual(failure.failure_code, "byte_limit")
+        self.assertIsNotNone(failure.worker_exit_status)
+        self.assertFalse(self.final.exists())
+
+    def test_prepublication_validation_failure_has_supervisor_operation(self):
+        original = acquire._path
+        def checked(path, **kwargs):
+            if path == self.final:
+                raise acquire.Failure("destination_policy")
+            return original(path, **kwargs)
+        with patch.object(acquire, "_path", side_effect=checked):
+            failure = self.failure("destination_policy", self.child, "success")
+        self.assertEqual(failure.last_validated_phase, "ready")
+        self.assertEqual(failure.attempted_operation, "publication_validation")
+        self.assertEqual(failure.operation_source, "supervisor")
+        self.assertEqual(failure.worker_exit_status, 0)
+        self.assertFalse(self.final.exists())
+
+    def test_atomic_publication_failure_is_sanitized_and_cannot_publish(self):
+        with patch.object(Path, "rename", side_effect=OSError(SECRET)):
+            failure = self.failure("supervisor_failure", self.child, "success")
+        self.assertEqual(failure.last_validated_phase, "ready")
+        self.assertEqual(failure.attempted_operation, "publication")
+        self.assertEqual(failure.operation_source, "supervisor")
+        self.assertEqual(failure.worker_exit_status, 0)
+        self.assertFalse(self.final.exists())
+
+    def test_parent_failure_before_worker_has_no_exit_status_or_phase(self):
+        with patch.object(acquire, "_destination", side_effect=OSError(SECRET)), \
+                redirect_stderr(io.StringIO()) as stderr, redirect_stdout(io.StringIO()) as stdout:
+            self.assertEqual(acquire.main(["acquire"]), 2)
+        output = json.loads(stderr.getvalue())
+        self.assertIsNone(output["last_validated_phase"])
+        self.assertIsNone(output["worker_exit_status"])
+        self.assertEqual(output["attempted_operation"], "destination_validation")
+        self.assertEqual(output["operation_source"], "supervisor")
+        self.assertNotIn(SECRET, stdout.getvalue()+stderr.getvalue())
+
+    def test_worker_start_failure_has_no_exit_status_or_validated_phase(self):
+        with patch.object(acquire.subprocess, "Popen", side_effect=OSError(SECRET)):
+            failure = self.failure("supervisor_failure", self.child, "success")
+        self.assertIsNone(failure.worker_exit_status)
+        self.assertIsNone(failure.last_validated_phase)
+        self.assertEqual(failure.attempted_operation, "worker_start")
+        self.assertEqual(failure.operation_source, "supervisor")
+        self.assertNotIn(SECRET, acquire._json_bytes(acquire._failure_json(failure)).decode("ascii"))
+
+    def test_final_cli_json_preserves_worker_diagnostics_without_raw_text(self):
+        failure = self.diagnostic("metadata", "response_encoding", "before:schedules", "header_validation")
+        with patch.object(acquire, "_destination", return_value=self.final), \
+                patch.object(acquire, "_supervise", side_effect=failure), \
+                redirect_stderr(io.StringIO()) as stderr, redirect_stdout(io.StringIO()) as stdout:
+            self.assertEqual(acquire.main(["acquire"]), 2)
+        self.assertEqual(json.loads(stderr.getvalue()), acquire._failure_json(failure))
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertNotIn(SECRET, stderr.getvalue())
+
+
+def diagnostic_worker_fixture(mode, final):
+    """Exercise production worker reporting through ONLY fake acquisition I/O."""
+    from contextlib import ExitStack
+    import builtins
+    backend = Backend()
+    original_print = builtins.print
+    def safe_print(*args, **kwargs):
+        if mode == "before_phase" and args == ("prepare",):
+            raise OSError(SECRET)
+        return original_print(*args, **kwargs)
+    def request(endpoint):
+        response = backend(endpoint)
+        if endpoint == acquire._metadata_endpoint("schedules"):
+            if mode == "metadata":
+                response.headers += (("Content-Encoding", "gzip"),)
+            elif mode == "close_primary":
+                response.close_error = OSError(SECRET)
+            elif mode == "close_secondary":
+                response.read_error, response.close_error = acquire.Failure("byte_limit"), OSError(SECRET)
+        if mode == "artifact" and endpoint == acquire._artifact_endpoint("schedules"):
+            response.read_error = OSError(location())
+        return response
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(acquire, "_destination", return_value=final))
+        stack.enter_context(patch.object(acquire, "_open", side_effect=request))
+        stack.enter_context(patch.object(builtins, "print", side_effect=safe_print))
+        if mode in ("prepare", "unknown", "unknown_code"):
+            error = (acquire.Failure("reparse_path") if mode == "prepare" else
+                     OSError(SECRET) if mode == "unknown" else acquire.Failure(SECRET))
+            stack.enter_context(patch.object(acquire, "_prepare", side_effect=error))
+        if mode == "verification":
+            stack.enter_context(patch.object(acquire, "_verify_stage", side_effect=acquire.Failure("integrity_mismatch")))
+        return acquire._worker_main()
+
+
 def child_fixture(mode, final):
     """Only synthetic children: install the same no-network/write audit."""
     global TEST_ROOT
@@ -718,6 +969,8 @@ def child_fixture(mode, final):
     if not TEST_ROOT.is_absolute() or TEST_ROOT.is_relative_to(REPOSITORY):
         return 4
     sys.addaudithook(audit)
+    if mode.startswith("diagnostic:"):
+        return diagnostic_worker_fixture(mode.partition(":")[2], final)
     def progress(phase):
         print(phase, flush=True)
     progress("pid:"+str(os.getpid()+1 if mode == "wrong_pid" else os.getpid()))
@@ -729,6 +982,42 @@ def child_fixture(mode, final):
         return 2
     stage = acquire._prepare(final)
     progress("owned")
+    if mode.startswith("protocol:"):
+        kind = mode.partition(":")[2]
+        acquire._attempt("metadata_collection")
+        record = acquire._worker_failure(acquire.Failure("byte_limit"))
+        if kind == "malformed":
+            progress("{broken")
+        elif kind == "oversized":
+            progress("{"+SECRET*20)
+        elif kind == "unterminated":
+            sys.stdout.write("{"+SECRET)
+            sys.stdout.flush()
+        elif kind == "duplicate_phase":
+            progress("prepare")
+        elif kind in ("duplicate_failure", "after_failure"):
+            progress(record)
+            progress(record if kind == "duplicate_failure" else "before:schedules")
+        elif kind in ("unknown_code", "extra_field"):
+            value = json.loads(record)
+            value.update(dict(code=SECRET) if kind == "unknown_code" else dict(url=SECRET))
+            progress(acquire._json_bytes(value).decode("ascii"))
+        elif kind == "duplicate_key":
+            progress('{"type":"failure","type":"failure"}')
+        elif kind == "failure_after_ready":
+            acquire._batch(stage, Backend(), progress, utc=lambda: STAMP)
+            progress("ready")
+            progress(record)
+        return 2
+    if mode == "exit_seven":
+        return 7
+    if mode in ("failure_exit_zero", "failure_hang"):
+        progress("before:schedules")
+        acquire._attempt("metadata_collection")
+        progress(acquire._worker_failure(acquire.Failure("byte_limit")))
+        if mode == "failure_hang":
+            time.sleep(3600)
+        return 0
     if mode in ("crash", "crash_unknown"):
         (stage/("unknown" if mode == "crash_unknown" else "games.csv.gz")).write_bytes(b"preserve")
         return 3
@@ -738,7 +1027,8 @@ def child_fixture(mode, final):
         print(location(), file=sys.stderr)
         return 2
     if mode == "close_failure":
-        print("failed_cleanup", flush=True)
+        acquire._attempt("response_close")
+        print(acquire._worker_failure(acquire.Failure("cleanup_failure")), flush=True)
         return 2
     backend = Backend()
     def blocked_dns(*args, **kwargs):
