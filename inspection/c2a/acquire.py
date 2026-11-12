@@ -17,6 +17,11 @@ the attempted operation, identifies worker/supervisor attribution, and reports
 the worker exit status when available. A phase announcement is not completion.
 Abrupt exits may leave the worker's exact attempted operation unknown.
 
+HTTP bodies use one Content-Length or one chunked transfer coding, never both.
+CPython 3.14's HTTPResponse reads chunk payloads; strict control-line checks
+reject malformed delimiters, chunk extensions and nonempty trailers. Budgets
+and SHA-256 count entity bytes (the original gzip file), not chunk framing.
+
 HTTPS identifies the hosting service; SHA-256 binds the saved compressed bytes
 to GitHub's metadata. Neither authenticates NFL facts nor proves pregame access.
 This module does not decompress, inspect CSVs, use SQLite, or place wagers.
@@ -94,6 +99,7 @@ FAILURE_CODES = frozenset((
     "stream_failure", "supervisor_failure", "supervisor_required", "timestamp",
     "tls_environment", "tls_policy", "transport_failure", "windows_required",
     "worker_failed", "worker_pid", "worker_protocol", "worker_exit", "unexpected_exception",
+    "response_framing", "chunked_framing",
 ))
 WORKER_OPERATIONS = frozenset((
     "worker_handshake", "destination_validation", "staging_prepare", "metadata_collection",
@@ -329,14 +335,44 @@ class _HeaderSocket:
         self.sock = sock
 
     def makefile(self, mode):
-        return _HeaderReader(self.sock.makefile(mode))
+        return _HeaderReader(self.sock.makefile(mode, buffering=CHUNK))
 
 
 class _Response(http.client.HTTPResponse):
+    """Keep CPython's bounded payload decoder; tighten its three framing hooks.
+
+    The inspected 3.14 decoder accepts int() spellings, discards unchecked
+    delimiters and tolerates EOF in trailers. These hooks validate that syntax;
+    HTTPResponse._read_chunked still owns payload reads and chunk accounting.
+    Extensions and nonempty trailers deliberately fail closed. Raw-wire tests
+    cover these private CPython integration points; no independent decoder.
+    """
+
     def _read_status(self):
         result = super()._read_status()
         _require(result[1] >= 200, "response_status")  # No interim header blocks.
+        self._wire_version = result[0]
         return result
+
+    def _read_next_chunk_size(self):
+        _require(self._wire_version == "HTTP/1.1", "response_framing")
+        line = self.fp.readline(HEADER_CAP+1)
+        _require(len(line) <= HEADER_CAP and re.fullmatch(rb"[0-9A-Fa-f]+\r\n", line),
+                 "chunked_framing")
+        return int(line, 16)
+
+    def _get_chunk_left(self):
+        if self.chunk_left == 0:
+            _require(self._safe_read(2) == b"\r\n", "chunked_framing")
+            # The delimiter is already checked/consumed; let the stdlib read
+            # the next size without discarding another two bytes.
+            self.chunk_left = None
+        return super()._get_chunk_left()
+
+    def _read_and_discard_trailer(self):
+        # Only the mandatory empty trailer section is supported. EOF, a lone
+        # LF, a partial line, or any trailer field is rejected, never ignored.
+        _require(self.fp.readline(HEADER_CAP+1) == b"\r\n", "chunked_framing")
 
 
 class _LiveResponse:
@@ -346,7 +382,12 @@ class _LiveResponse:
         self.headers = tuple(response.getheaders())
 
     def read(self, count):
-        return self.response.read(count)
+        try:
+            return self.response.read(count)
+        except http.client.IncompleteRead:
+            if self.response.chunked:
+                raise Failure("chunked_framing") from None
+            raise
 
     def close(self):
         try:
@@ -428,15 +469,19 @@ def _headers(response):
         used += len(key.encode("utf-8")) + len(value.encode("utf-8")) + 4
         _require(used <= HEADER_CAP, "header_limit")
         headers.setdefault(key.lower(), []).append(value)
-    for key in ("content-length", "transfer-encoding", "content-encoding", "location"):
+    for key in ("content-length", "transfer-encoding"):
+        _require(len(headers.get(key, [])) <= 1, "response_framing")
+    for key in ("content-encoding", "location"):
         _require(len(headers.get(key, [])) <= 1, "response_headers")
-    _require("transfer-encoding" not in headers
-             and headers.get("content-encoding", ["identity"]) == ["identity"], "response_encoding")
+    _require(headers.get("content-encoding", ["identity"]) == ["identity"], "response_encoding")
+    if "transfer-encoding" in headers:
+        _require(headers["transfer-encoding"][0].lower() == "chunked"
+                 and "content-length" not in headers, "response_framing")
     return headers
 
 
 def _receive(endpoint, cap, sink, request, *, aid=None, expected=None):
-    """Bound raw HTTP representation bytes; reject unsupported HTTP framing."""
+    """Bound decoded entity bytes; never HTTP chunk sizes, CRLFs or trailers."""
     _require(type(cap) is int and cap >= 0, "byte_limit")
     current, redirected = endpoint, False
     while True:
@@ -457,14 +502,17 @@ def _receive(endpoint, cap, sink, request, *, aid=None, expected=None):
             _attempt("response_validation")
             _require(response.status == 200 and "location" not in headers, "response_status")
             length_text = headers.get("content-length", [])
-            _require(len(length_text) == 1 and re.fullmatch(r"0|[1-9][0-9]{0,9}", length_text[0]),
-                     "response_length")
-            length = int(length_text[0])
-            _require(length <= cap, "byte_limit")
-            _require(expected is None or length == expected, "length_mismatch")
+            if "transfer-encoding" in headers:
+                length = None  # Exclusivity/coding were checked by _headers.
+            else:
+                _require(len(length_text) == 1 and re.fullmatch(r"0|[1-9][0-9]{0,9}", length_text[0]),
+                         "response_framing")
+                length = int(length_text[0])
+                _require(length <= cap, "byte_limit")
+                _require(expected is None or length == expected, "length_mismatch")
             used, digest = 0, hashlib.sha256()
             while True:
-                count = min(CHUNK, cap-used+1)
+                count = min(CHUNK, cap-used+1, expected-used+1 if expected is not None else CHUNK)
                 _attempt("response_read")
                 chunk = response.read(count)
                 _require(type(chunk) is bytes and len(chunk) <= count, "response_protocol")
@@ -472,11 +520,13 @@ def _receive(endpoint, cap, sink, request, *, aid=None, expected=None):
                     break
                 used += len(chunk)
                 _require(used <= cap, "byte_limit")
-                _require(used <= length, "length_mismatch")
+                _require(length is None or used <= length, "length_mismatch")
+                _require(expected is None or used <= expected, "length_mismatch")
                 _attempt("response_store")
                 sink(chunk)
                 digest.update(chunk)
-            _require(used == length, "length_mismatch")
+            _require(length is None or used == length, "length_mismatch")
+            _require(expected is None or used == expected, "length_mismatch")
             return used, digest.hexdigest()
         except BaseException as error:
             primary = error if isinstance(error, Failure) else Failure("stream_failure")

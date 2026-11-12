@@ -117,6 +117,77 @@ class FakeResponse:
             raise self.close_error
 
 
+class FragmentedWire(io.RawIOBase):
+    """Socket-free raw bytes, fragmented BEFORE production HTTP parsing."""
+
+    def __init__(self, body, fragment=7):
+        super().__init__()
+        self.body, self.fragment, self.position = body, fragment, 0
+        self.read_sizes = []
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        self.read_sizes.append(len(buffer))
+        count = min(len(buffer), self.fragment, len(self.body)-self.position)
+        buffer[:count] = self.body[self.position:self.position+count]
+        self.position += count
+        return count
+
+
+class WireSocket:
+    def __init__(self, wire, fragment=7):
+        self.raw = FragmentedWire(wire, fragment)
+        self.stream = io.BufferedReader(self.raw, buffer_size=acquire.CHUNK)
+        self.closes, self.sent = 0, []
+
+    def makefile(self, mode, buffering):
+        if buffering != acquire.CHUNK:
+            raise AssertionError("Production socket buffer must be explicitly bounded")
+        return self.stream
+
+    def close(self):
+        self.closes += 1
+        self.stream.close()
+
+    def getpeername(self):
+        return ("8.8.8.8", 443)
+
+    def settimeout(self, timeout):
+        pass
+
+    def sendall(self, body):
+        self.sent.append(body)
+
+
+def chunk_wire(body, sizes=(1, 3, 11, 257)):
+    parts, used, index = [], 0, 0
+    while used < len(body):
+        count = min(sizes[index % len(sizes)], len(body)-used)
+        parts.append(f"{count:X}\r\n".encode("ascii")+body[used:used+count]+b"\r\n")
+        used, index = used+count, index+1
+    return b"".join(parts)+b"0\r\n\r\n"
+
+
+def raw_http(wire_body, headers, *, status=200):
+    return (f"HTTP/1.1 {status} Synthetic\r\n".encode("ascii")
+            +b"".join((key+": "+value+"\r\n").encode("ascii") for key, value in headers)
+            +b"\r\n"+wire_body)
+
+
+def parsed_response(wire, *, fragment=7):
+    tls = WireSocket(wire, fragment)
+    response = acquire._Response(acquire._HeaderSocket(tls), method="GET")
+    try:
+        response.begin()
+        return acquire._LiveResponse(response, tls)
+    except BaseException:
+        response.close()
+        tls.close()
+        raise
+
+
 def fixture_rows():
     pid = "00-0000001"
     schedules = [dict(game_id=f"{year}_07_AWY_HOM", season=str(year), week="7", game_type="REG",
@@ -172,6 +243,27 @@ class Backend:
             else:
                 raise AssertionError("Unexpected synthetic endpoint")
         self.responses.append(response)
+        return response
+
+
+class RawHTTPBackend(Backend):
+    """Feed every response through the real header and chunk-payload decoder."""
+
+    def __init__(self, *, chunk_metadata=True, chunk_artifacts=True, malformed=None):
+        super().__init__()
+        self.chunk_metadata, self.chunk_artifacts, self.malformed = chunk_metadata, chunk_artifacts, malformed
+        self.raw_responses = []
+
+    def __call__(self, endpoint):
+        fixture = super().__call__(endpoint)
+        metadata = endpoint.host == "api.github.com"
+        chunked = self.chunk_metadata if metadata else self.chunk_artifacts
+        body = chunk_wire(fixture.body) if chunked else fixture.body
+        headers = (("Transfer-Encoding", "chunked"),) if chunked else fixture.headers
+        if self.malformed == ("metadata" if metadata else "artifact"):
+            body = chunk_wire(fixture.body)[:-2]  # Missing final trailer CRLF.
+        response = parsed_response(raw_http(body, headers))
+        self.raw_responses.append(response)
         return response
 
 
@@ -343,7 +435,7 @@ class TransportTests(Cases):
 
     def test_wire_headers_are_capped_before_parsing(self):
         class Sock:
-            def makefile(self, mode):
+            def makefile(self, mode, buffering):
                 return io.BytesIO(b"HTTP/1.1 200 OK\r\n" + (b"X-A: "+b"a"*2000+b"\r\n")*40+b"\r\n")
         response = acquire._Response(acquire._HeaderSocket(Sock()), method="GET")
         self.addCleanup(response.close)
@@ -354,7 +446,7 @@ class TransportTests(Cases):
                      b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nmissing-colon\r\n\r\nx",
                      b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nX-A: nul\x00\r\n\r\nx"):
             class Sock:
-                def makefile(self, mode):
+                def makefile(self, mode, buffering):
                     return io.BytesIO(body)
             response = acquire._Response(acquire._HeaderSocket(Sock()), method="GET")
             self.addCleanup(response.close)
@@ -449,6 +541,187 @@ class TransferTests(Cases):
         response = FakeResponse(b"x"*(acquire.CHUNK+10))
         self.receive(response, cap=2*acquire.CHUNK)
         self.assertLessEqual(max(response.reads), acquire.CHUNK)
+
+
+class RawHTTPFramingTests(Cases):
+    def receive_raw(self, wire, *, cap=100, expected=None, fragment=7):
+        response = parsed_response(wire, fragment=fragment)
+        self.addCleanup(response.close)
+        self.last_response = response
+        saved = bytearray()
+        result = acquire._receive(acquire._artifact_endpoint("schedules"), cap, saved.extend,
+                                  lambda _: response, aid="schedules", expected=expected)
+        return bytes(saved), result
+
+    def test_raw_content_length_body_and_digest(self):
+        body = b"original entity bytes"
+        saved, result = self.receive_raw(raw_http(body, (("Content-Length", str(len(body))),)),
+                                         expected=len(body))
+        self.assertEqual(saved, body)
+        self.assertEqual(result, (len(body), hashlib.sha256(body).hexdigest()))
+        self.assertEqual(self.last_response.tls.closes, 1)
+
+    def test_raw_chunked_body_and_digest_exclude_chunk_framing(self):
+        body = Backend().data["schedules"]
+        saved, result = self.receive_raw(raw_http(chunk_wire(body), (("Transfer-Encoding", "chunked"),)),
+                                         cap=len(body), expected=len(body))
+        self.assertEqual(saved, body)
+        self.assertEqual(result, (len(body), hashlib.sha256(body).hexdigest()))
+        self.assertTrue(self.last_response.response.chunked)
+        self.assertEqual(self.last_response.tls.closes, 1)
+
+    def test_raw_chunked_reads_cross_many_wire_and_payload_boundaries(self):
+        body = bytes(range(256))*270  # Larger than one production read.
+        for fragment in (1, 7, 8192):
+            with self.subTest(fragment=fragment):
+                saved, result = self.receive_raw(
+                    raw_http(chunk_wire(body, (1, 2, 65537)), (("Transfer-Encoding", "chunked"),)),
+                    cap=len(body), fragment=fragment)
+                self.assertEqual(saved, body)
+                self.assertEqual(result[0], len(body))
+                self.assertLessEqual(max(self.last_response.tls.raw.read_sizes), acquire.CHUNK)
+
+    def test_exact_entity_limit_accepts_large_framing_overhead(self):
+        body = b"x"*128
+        wire_body = chunk_wire(body, (1,))
+        self.assertGreater(len(wire_body), len(body))
+        saved, _ = self.receive_raw(raw_http(wire_body, (("Transfer-Encoding", "chunked"),)), cap=128)
+        self.assertEqual(saved, body)
+
+    def test_actual_entity_bytes_exceeding_cap_fail_and_close(self):
+        self.failure("byte_limit", self.receive_raw,
+                     raw_http(chunk_wire(b"x"*129), (("Transfer-Encoding", "chunked"),)), cap=128)
+        self.assertEqual(self.last_response.tls.closes, 1)
+
+    def test_expected_metadata_length_rejects_short_and_long_chunked_bodies(self):
+        for body in (b"xx", b"xxxx"):
+            self.failure("length_mismatch", self.receive_raw,
+                         raw_http(chunk_wire(body), (("Transfer-Encoding", "chunked"),)), expected=3)
+
+    def test_missing_duplicate_conflicting_or_invalid_framing_is_rejected(self):
+        cases = ((), (("Content-Length", "1"), ("content-length", "1")),
+                 (("Transfer-Encoding", "chunked"), ("transfer-encoding", "chunked")),
+                 (("Content-Length", "1"), ("Transfer-Encoding", "chunked")),
+                 (("Content-Length", "-1"),), (("Content-Length", "+1"),),
+                 (("Content-Length", "01"),), (("Content-Length", "1, 1"),),
+                 (("Content-Length", "1 "),), (("Content-Length", ""),))
+        for headers in cases:
+            with self.subTest(headers=headers):
+                failure = self.failure("response_framing", self.receive_raw, raw_http(b"x", headers))
+                self.assertIn(failure.attempted_operation, ("header_validation", "response_validation"))
+                self.assertEqual(self.last_response.tls.closes, 1)
+
+    def test_unsupported_or_ambiguous_transfer_codings_are_rejected(self):
+        for value in ("gzip", "identity", "gzip, chunked", "chunked, gzip", "chunked, chunked",
+                      "chunked;param=x", "chunked ", ""):
+            self.failure("response_framing", self.receive_raw,
+                         raw_http(b"0\r\n\r\n", (("Transfer-Encoding", value),)))
+
+    def test_chunked_token_is_case_insensitive(self):
+        saved, _ = self.receive_raw(raw_http(chunk_wire(b"data"), (("Transfer-Encoding", "Chunked"),)))
+        self.assertEqual(saved, b"data")
+
+    def test_chunked_requires_http_11_but_content_length_10_still_works(self):
+        wire = raw_http(chunk_wire(b"data"), (("Transfer-Encoding", "chunked"),))
+        for version in (b"HTTP/1.0", b"HTTP/1.2"):
+            self.failure("response_framing", self.receive_raw, wire.replace(b"HTTP/1.1", version, 1))
+        wire = raw_http(b"data", (("Content-Length", "4"),)).replace(b"HTTP/1.1", b"HTTP/1.0", 1)
+        saved, _ = self.receive_raw(wire)
+        self.assertEqual(saved, b"data")
+
+    def test_malformed_size_lines_are_rejected_without_dependency_text(self):
+        for size in (b"+1", b"-1", b" 1", b"1 ", b"0x1", b"G", b"", SECRET.encode(),
+                     b"1\n", b"1"* (acquire.HEADER_CAP+1)):
+            body = size+b"\r\nx\r\n0\r\n\r\n"
+            failure = self.failure("chunked_framing", self.receive_raw,
+                                   raw_http(body, (("Transfer-Encoding", "chunked"),)))
+            self.assertEqual(failure.attempted_operation, "response_read")
+            self.assertEqual(self.last_response.tls.closes, 1)
+            self.assertNotIn(SECRET, acquire._worker_failure(failure))
+
+    def test_truncated_payload_delimiters_and_trailers_are_rejected(self):
+        for body in (b"2\r\nx", b"2\r\n", b"1\r\nx", b"1\r\nx\r", b"1\r\nx!!0\r\n\r\n",
+                     b"1\r\nx\r\n", b"0\r\n", b"0\r\n\r", b"0\r\n\n",
+                     b"1\r\nx\r\n0", b"1\r\nx\r\n0\r\n"):
+            self.failure("chunked_framing", self.receive_raw,
+                         raw_http(body, (("Transfer-Encoding", "chunked"),)))
+            self.assertEqual(self.last_response.tls.closes, 1)
+
+    def test_extensions_and_nonempty_trailers_explicitly_fail_closed(self):
+        for body in (b"1;ext=value\r\nx\r\n0\r\n\r\n", b"0;ext=value\r\n\r\n",
+                     b"1\r\nx\r\n0\r\nX-Trailer: value\r\n\r\n",
+                     b"0\r\nX-Trailer: incomplete", b"0\r\n"+b"x"*(acquire.HEADER_CAP+1)):
+            self.failure("chunked_framing", self.receive_raw,
+                         raw_http(body, (("Transfer-Encoding", "chunked"),)))
+
+    def test_empty_entity_and_mandatory_empty_trailer_are_supported(self):
+        saved, result = self.receive_raw(raw_http(b"000\r\n\r\n", (("Transfer-Encoding", "chunked"),)), cap=0)
+        self.assertEqual(saved, b"")
+        self.assertEqual(result, (0, hashlib.sha256(b"").hexdigest()))
+
+    def test_unexpected_content_encoding_is_rejected_before_body_read(self):
+        self.failure("response_encoding", self.receive_raw,
+                     raw_http(chunk_wire(b"data"), (("Transfer-Encoding", "chunked"),
+                                                    ("Content-Encoding", "gzip"))))
+
+    def test_chunked_body_uses_real_open_and_production_decoder(self):
+        from unittest.mock import Mock
+        body = b'{"synthetic":true}'
+        tls = WireSocket(raw_http(chunk_wire(body), (("Transfer-Encoding", "chunked"),)), fragment=1)
+        raw, context = Mock(), Mock()
+        raw.getpeername.return_value = ("8.8.8.8", 443)
+        context.wrap_socket.return_value = tls
+        with patch.object(acquire.socket, "getaddrinfo", return_value=[
+                (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("8.8.8.8", 443))]), \
+                patch.object(acquire.socket, "socket", return_value=raw), \
+                patch.object(acquire, "_tls_context", return_value=context):
+            saved = bytearray()
+            count, digest = acquire._receive(acquire._metadata_endpoint("players"), 100, saved.extend, acquire._open)
+        self.assertEqual(bytes(saved), body)
+        self.assertEqual((count, digest), (len(body), hashlib.sha256(body).hexdigest()))
+        self.assertEqual(tls.closes, 1)
+        context.wrap_socket.assert_called_once_with(raw, server_hostname="api.github.com")
+
+    def test_chunked_metadata_and_artifacts_complete_and_match_offline_inspector(self):
+        for label, metadata, artifacts in (("metadata", True, False), ("artifacts", False, True),
+                                           ("both", True, True)):
+            with self.subTest(label=label):
+                self.final = self.root/label/"run-001"
+                backend = RawHTTPBackend(chunk_metadata=metadata, chunk_artifacts=artifacts)
+                stage = self.batch(backend)
+                report = inspector.inspect_manifest(stage, stage/"manifest.json", as_of=STAMP)
+                self.assertEqual(len(report["raw_observations"]), 6)
+                manifest = json.loads((stage/"manifest.json").read_text())
+                for entry in manifest["artifacts"]:
+                    body = backend.data[entry["artifact_id"]]
+                    self.assertEqual(entry["sha256"], hashlib.sha256(body).hexdigest())
+                    self.assertEqual(entry["byte_length"], len(body))
+                self.assertTrue(all(r.tls.closes == 1 for r in backend.raw_responses))
+
+    def test_chunked_bytes_still_respect_total_metadata_and_artifact_caps(self):
+        backend = RawHTTPBackend()
+        with patch.object(acquire, "METADATA_TOTAL", 20):
+            self.failure("byte_limit", self.batch, backend)
+        self.final = self.root/"other"/"run-001"
+        with patch.object(acquire, "DATA_TOTAL", sum(len(b) for b in backend.data.values())-1):
+            self.failure("byte_limit", self.batch, RawHTTPBackend())
+
+    def test_supervised_raw_chunked_success_publishes_verified_gzip_files(self):
+        final = self.child("chunked_success")
+        inspector.inspect_manifest(final, final/"manifest.json", as_of=STAMP)
+        self.assertFalse(final.with_name("run-001.incomplete").exists())
+
+    def test_malformed_raw_chunked_metadata_and_artifacts_cleanup_without_publication(self):
+        for label, phase in (("metadata", "before:schedules"), ("artifact", "artifact:schedules")):
+            with self.subTest(label=label):
+                failure = self.failure("worker_failed", self.child, "diagnostic:chunked_"+label)
+                self.assertEqual(failure.failure_code, "chunked_framing")
+                self.assertEqual(failure.last_validated_phase, phase)
+                self.assertEqual(failure.attempted_operation, "response_read")
+                self.assertEqual(failure.worker_exit_status, 2)
+                self.assertFalse(failure.cleanup_failed)
+                self.assertFalse(self.final.exists())
+                self.assertFalse(self.final.with_name("run-001.incomplete").exists())
 
 
 class MetadataAndBatchTests(Cases):
@@ -931,7 +1204,8 @@ def diagnostic_worker_fixture(mode, final):
     """Exercise production worker reporting through ONLY fake acquisition I/O."""
     from contextlib import ExitStack
     import builtins
-    backend = Backend()
+    backend = (RawHTTPBackend(malformed=mode.partition("_")[2])
+               if mode in ("chunked_metadata", "chunked_artifact") else Backend())
     original_print = builtins.print
     def safe_print(*args, **kwargs):
         if mode == "before_phase" and args == ("prepare",):
@@ -1030,7 +1304,7 @@ def child_fixture(mode, final):
         acquire._attempt("response_close")
         print(acquire._worker_failure(acquire.Failure("cleanup_failure")), flush=True)
         return 2
-    backend = Backend()
+    backend = RawHTTPBackend() if mode == "chunked_success" else Backend()
     def blocked_dns(*args, **kwargs):
         time.sleep(3600)
         raise AssertionError("Supervisor did not terminate blocked resolver")
