@@ -378,7 +378,20 @@ def _period(row, role):
 
 
 def _identifier(value):
-    return type(value) is str and value not in NULLS and bool(re.fullmatch(r"[0-9]{2}-[0-9]{7}", value))
+    """Opaque source-field text, not verification of GSIS identity or format."""
+    return (_text(value) and len(value.encode("utf-8")) <= LIMITS["field_bytes"]
+            and all(c.isprintable() and not c.isspace() for c in value))
+
+
+def _identifier_namespaces(row):
+    """Retain explicit declarations; C2a has no authority to map namespaces.
+
+    The existing joins use only players/rosters.gsis_id and stats.player_id.
+    An additional namespace assertion cannot silently join the default source
+    fields, even when its text value happens to match. Report it unresolved.
+    Other reference ID columns (e.g. pfr_id) are never identity crosswalks.
+    """
+    return {name: row[name] for name in ("gsis_id_namespace", "player_id_namespace", "identifier_namespace") if name in row}
 
 
 def _text(value):
@@ -401,13 +414,20 @@ def _lexical(value):
     return "text"
 
 
-def _completion(row, as_of):
-    """Scores are necessary; dates alone never establish completion.
+def _retrospective_result(row):
+    """A result in the supplied artifact is not evidence of its historical time."""
+    status = row.get("game_status")
+    return (status in (None, *NULLS, "FINAL", "COMPLETED")
+            and all(_number(row.get(key), low=0, high=10000) is not None for key in ("home_score", "away_score")))
 
-    Schedules lack a final whistle timestamp. Result is a conservative
-    score-based completion indicator, not independently verified actual start.
-    If IANA time data is absent, only dates with a conservative two-day margin
-    can pass the not-future check. Near-boundary cases remain unknown.
+
+def _completion(row, as_of):
+    """Classify time consistency, never establish historical completion.
+
+    Current scores and undated FINAL status cannot establish a conclusion at
+    as_of. No completion/publication evidence contract is implemented here.
+    The existing two-day timezone fallback ONLY bounds whether kickoff could
+    be in the future; it is never a guessed duration or completion timestamp.
     """
     event = None
     if _text(row.get("kickoff_utc")):
@@ -442,8 +462,7 @@ def _completion(row, as_of):
     status = row.get("game_status")
     if status is not None and status not in NULLS and status not in ("FINAL", "COMPLETED"):
         return "source_not_final", event
-    scores = [_number(row.get(key), low=0, high=10000) for key in ("home_score", "away_score")]
-    return ("score_supported_completed" if all(v is not None for v in scores) else "completion_unknown"), event
+    return ("retrospective_result_only" if _retrospective_result(row) else "completion_unknown"), event
 
 
 def inspect_rows(tables, *, as_of=None, participation_evidence=()):
@@ -518,9 +537,12 @@ def inspect_rows(tables, *, as_of=None, participation_evidence=()):
     identities = defaultdict(list)
     for i, row in enumerate(tables["players"].rows, 1):
         pid = row["gsis_id"]
+        namespaces = _identifier_namespaces(row)
+        if namespaces:
+            issue("player_identifier_namespace_unresolved", "players", i, declarations=namespaces)
         if not _identifier(pid):
             issue("invalid_player_identifier", "players", i)
-        else:
+        elif not namespaces:
             index_add(identities, pid, i)
 
     games, orientations, team_games = defaultdict(list), defaultdict(list), defaultdict(list)
@@ -534,6 +556,8 @@ def inspect_rows(tables, *, as_of=None, participation_evidence=()):
         completion, event = _completion(row, reference)
         item = dict(row=i, game_id=gid, season=period[0], phase=period[1], week=period[2],
                     home_team=home, away_team=away, completion=completion,
+                    retrospective_result_observed=_retrospective_result(row),
+                    historical_completion_verified=False,
                     reported_gameday=row["gameday"], reported_gametime=row["gametime"],
                     derived_kickoff_utc=event.isoformat() if event else None)
         budget.retain(item)
@@ -550,7 +574,7 @@ def inspect_rows(tables, *, as_of=None, participation_evidence=()):
     for aid in ("rosters_2025", "rosters_2026"):
         for i, row in enumerate(tables[aid].rows, 1):
             period = _period(row, "roster")
-            if period and period[0] == SPECS[aid]["season"]:
+            if period and period[0] == SPECS[aid]["season"] and not _identifier_namespaces(row):
                 index_add(roster_occurrences, (*period, row["team"], row["gsis_id"]), [aid, i])
     for key, occurrences in sorted(roster_occurrences.items()):
         if len(occurrences) > 1:
@@ -560,6 +584,9 @@ def inspect_rows(tables, *, as_of=None, participation_evidence=()):
     for aid in ("stats_2025", "stats_2026"):
         for i, row in enumerate(tables[aid].rows, 1):
             period, pid = _period(row, "stats"), row["player_id"]
+            namespaces = _identifier_namespaces(row)
+            if namespaces:
+                issue("player_identifier_namespace_unresolved", aid, i, declarations=namespaces)
             matches = orientations.get((*period, row["team"], row["opponent_team"]), []) if period else []
             count = len(matches)
             resolved = matches[0]["game_id"] if count == 1 and len(games[matches[0]["game_id"]]) == 1 else None
@@ -570,25 +597,26 @@ def inspect_rows(tables, *, as_of=None, participation_evidence=()):
             if resolved and row.get("game_id") not in (None, resolved):
                 issue("stats_game_id_disagreement", aid, i)
                 resolved = None
-            id_count = len(identities.get(pid, []))
+            id_count = len(identities.get(pid, [])) if not namespaces else 0
             if id_count != 1:
                 issue("stats_identity_join_zero" if id_count == 0 else "stats_identity_join_multiple", aid, i, match_count=id_count)
             if not _identifier(pid):
                 issue("invalid_player_identifier", aid, i)
-            if period and period[0] == SPECS[aid]["season"]:
+            if period and period[0] == SPECS[aid]["season"] and not namespaces:
                 seen_ids[str(period[0])].add(pid)
-            elif period:
+            elif period and period[0] != SPECS[aid]["season"]:
                 resolved = None
-            roster_count = len(roster_occurrences.get((*period, row["team"], pid), [])) if period else 0
+            roster_count = len(roster_occurrences.get((*period, row["team"], pid), [])) if period and not namespaces else 0
             if roster_count != 1:
                 issue("stats_roster_join_zero" if roster_count == 0 else "stats_roster_join_multiple", aid, i, match_count=roster_count)
             join = dict(artifact=aid, row=i, player_id=pid, game_match_count=count,
-                        identity_match_count=id_count, roster_match_count=roster_count, resolved_game_id=resolved)
+                        identity_match_count=id_count, roster_match_count=roster_count, resolved_game_id=resolved,
+                        source_namespace_declarations=namespaces)
             budget.retain(join)
             stat_joins.append(join)
-            if resolved and _identifier(pid):
+            if resolved and _identifier(pid) and not namespaces:
                 index_add(stat_games, (pid, resolved), (aid, i, row))
-                if games[resolved][0]["completion"] != "score_supported_completed":
+                if not games[resolved][0]["historical_completion_verified"]:
                     issue("statistics_for_unverified_completed_game", aid, i, game_id=resolved)
     for (pid, gid), rows in sorted(stat_games.items()):
         if len(rows) > 1:
@@ -613,9 +641,12 @@ def inspect_rows(tables, *, as_of=None, participation_evidence=()):
     for aid in ("rosters_2025", "rosters_2026"):
         for i, row in enumerate(tables[aid].rows, 1):
             period, pid = _period(row, "roster"), row["gsis_id"]
+            namespaces = _identifier_namespaces(row)
+            if namespaces:
+                issue("player_identifier_namespace_unresolved", aid, i, declarations=namespaces)
             if not _identifier(pid):
                 issue("invalid_player_identifier", aid, i)
-            if period and period[0] == SPECS[aid]["season"]:
+            if period and period[0] == SPECS[aid]["season"] and not namespaces:
                 membership_key = (*period, pid)
                 budget.retain(membership_key)
                 memberships[membership_key].add(row["team"])
@@ -626,7 +657,8 @@ def inspect_rows(tables, *, as_of=None, participation_evidence=()):
             if not window or period[1] != "REG" or not window["weeks"][0] <= period[2] <= window["weeks"][1]:
                 continue
             matches = team_games.get((*period, row["team"]), [])
-            count, id_count = len(matches), len(identities.get(pid, []))
+            count = len(matches)
+            id_count = len(identities.get(pid, [])) if not namespaces else 0
             gid = matches[0]["game_id"] if count == 1 and len(games[matches[0]["game_id"]]) == 1 else None
             if count != 1:
                 issue("roster_game_join_zero" if count == 0 else "roster_game_join_multiple", aid, i, match_count=count)
@@ -636,8 +668,9 @@ def inspect_rows(tables, *, as_of=None, participation_evidence=()):
                 issue("roster_identity_join_zero" if id_count == 0 else "roster_identity_join_multiple", aid, i, match_count=id_count)
             candidate = dict(artifact=aid, row=i, player_id=pid, season=period[0], phase=period[1], week=period[2],
                              team=row["team"], roster_status=row["status"], roster_designated_wr=True,
+                             source_namespace_declarations=namespaces,
                              game_match_count=count, identity_match_count=id_count, game_id=gid,
-                             player_game_key=[pid, gid] if gid and _identifier(pid) else None,
+                             player_game_key=[pid, gid] if gid and _identifier(pid) and not namespaces else None,
                              schedule_state="matched" if gid else ("no_scheduled_game" if count == 0 else "ambiguous"),
                              bye_status="unverified" if count == 0 else "not_applicable",
                              roster_status_category="inactive_roster_status" if row["status"] == "INA" else "other_or_unknown",
@@ -645,26 +678,28 @@ def inspect_rows(tables, *, as_of=None, participation_evidence=()):
                              historical_pregame_knowability="not_established")
             budget.retain(candidate)
             candidates.append(candidate)
-            if gid:
+            if gid and not namespaces:
                 index_add(candidate_keys, (pid, gid), candidate)
 
     outcome_counts = Counter()
     for candidate in candidates:
         pid, gid = candidate["player_id"], candidate["game_id"]
         member_key = (candidate["season"], candidate["phase"], candidate["week"], pid)
-        ambiguous = (len(memberships[member_key]) > 1
+        ambiguous = (bool(candidate["source_namespace_declarations"])
+                     or len(memberships[member_key]) > 1
                      or len(roster_occurrences[(*member_key[:3], candidate["team"], pid)]) > 1
                      or (gid is not None and len(candidate_keys[(pid, gid)]) > 1))
         candidate["roster_membership_ambiguous"] = ambiguous
         if ambiguous:
             issue("ambiguous_roster_membership", candidate["artifact"], candidate["row"])
-        supported = participation.get((pid, gid))
+        supported = participation.get((pid, gid)) if not candidate["source_namespace_declarations"] else None
         if supported:
             candidate["participation"] = supported["state"]
             candidate["participation_evidence"] = dict(supported, verification="caller_asserted_independent_evidence")
-        matches = stat_games.get((pid, gid), []) if gid and _identifier(pid) else []
+        matches = stat_games.get((pid, gid), []) if gid and _identifier(pid) and not candidate["source_namespace_declarations"] else []
         candidate["statistics_match_count"] = len(matches) if gid else None
         candidate["game_completion"] = games[gid][0]["completion"] if gid else None
+        candidate["historical_completion_verified"] = False
         if gid and len(matches) != 1:
             issue("candidate_stats_join_zero" if not matches else "candidate_stats_join_multiple", candidate["artifact"], candidate["row"], match_count=len(matches))
         usable = bool(gid and not ambiguous and candidate["identity_match_count"] == 1 and len(matches) == 1)
@@ -686,7 +721,7 @@ def inspect_rows(tables, *, as_of=None, participation_evidence=()):
                 state = ("null" if value in NULLS else "malformed") if parsed is None else ("zero" if parsed == 0 else "negative" if parsed < 0 else "positive")
             candidate["outcomes"][name] = dict(state=state, raw_value=value, parsed_integer=parsed)
             outcome_counts[name + ":" + state] += 1
-        candidate["outcome_usable_retrospectively"] = (usable and candidate["game_completion"] == "score_supported_completed"
+        candidate["outcome_usable_retrospectively"] = (usable and candidate["game_completion"] == "retrospective_result_only"
                                                        and candidate["outcomes"]["receiving_yards"]["parsed_integer"] is not None)
         if supported and supported["state"] == "known_inactive" and matches:
             issue("inactive_statistics_conflict", candidate["artifact"], candidate["row"])
@@ -705,12 +740,15 @@ def inspect_rows(tables, *, as_of=None, participation_evidence=()):
                                            "compatible_under_explicit_csv_rules" if not left["parse_failures"] and not right["parse_failures"] else "unresolved"),
                                    physical_types_verified=False)
     current = [g for g in schedule if g["season"] == 2026 and g["phase"] == "REG"]
-    completed = [g for g in current if g["completion"] == "score_supported_completed" and len(games[g["game_id"]]) == 1]
+    completed = [g for g in current if g["historical_completion_verified"] and len(games[g["game_id"]]) == 1]
+    retrospective_results = [g for g in current if g["retrospective_result_observed"] and len(games[g["game_id"]]) == 1]
     weeks = defaultdict(list)
     for game in current:
         weeks[game["week"]].append(game)
     complete_weeks = [w for w, rows in weeks.items() if all(r in completed for r in rows)]
     latest_game = max(completed, key=lambda g: (g["reported_gameday"], g["reported_gametime"], g["game_id"]), default=None)
+    dated_results = [g for g in retrospective_results if g["completion"] not in ("invalid_game_time", "future_game")]
+    latest_result_game = max(dated_results, key=lambda g: (g["reported_gameday"], g["reported_gametime"], g["game_id"]), default=None)
     def observed_week(aid):
         observed = (_period(row, SPECS[aid]["role"]) for row in tables[aid].rows)
         return max((p[2] for p in observed if p and p[0] == 2026 and p[1] == "REG"), default=None)
@@ -739,6 +777,8 @@ def inspect_rows(tables, *, as_of=None, participation_evidence=()):
             has_roster = (game["season"], game["phase"], game["week"], team) in roster_coverage
             item = dict(game_id=game["game_id"], season=game["season"], phase=game["phase"], week=game["week"], team=team,
                         completion=game["completion"], any_statistics_row=(game["game_id"], team) in covered,
+                        retrospective_result_observed=game["retrospective_result_observed"],
+                        historical_completion_verified=game["historical_completion_verified"],
                         any_roster_row=has_roster)
             budget.retain(item)
             coverage.append(item)
@@ -757,6 +797,8 @@ def inspect_rows(tables, *, as_of=None, participation_evidence=()):
             stamp = tables[aid].evidence.get(name)
             source_ages[aid][name] = (reference - _instant(stamp)).total_seconds() if reference and stamp else None
     result = dict(report_version=1, mode="offline_retrospective_inspection", reference_as_of=as_of,
+                  player_identifier_semantics="opaque_source_field_strings_not_verified_GSIS_no_namespace_crosswalks",
+                  completion_rule_interpretation="plan_rule_checks_kickoff_consistency_only_current_scores_never_verify_historical_completion",
                   explicit_csv_parse_rules=CSV_RULES,
                   raw_observations=raw,
                   interpretations=dict(analysis_windows=WINDOWS, schedule_games=schedule, statistics_joins=stat_joins,
@@ -767,10 +809,15 @@ def inspect_rows(tables, *, as_of=None, participation_evidence=()):
                   schema_compatibility=compatibility,
                   freshness=dict(season=2026, latest_observed_regular_season_week=max(weeks, default=None),
                                  latest_observed_completed_game=latest_game, latest_fully_completed_observed_week=latest_week,
+                                 historical_completion_evidence="unavailable_no_completion_evidence_contract",
+                                 latest_retrospective_result_game=latest_result_game,
+                                 retrospective_result_game_ids=[g["game_id"] for g in retrospective_results],
+                                 retrospective_result_coverage_is_not_completion_at_reference=True,
                                  latest_receiving_statistics_week=observed_week("stats_2026"),
                                  latest_weekly_roster_week=observed_week("rosters_2026"),
                                  coverage_meaning="latest_week_means_at_least_one_source_row_not_complete_coverage",
-                                 coverage_differences=[r for r in coverage if r["season"] == 2026 and r["phase"] == "REG" and r["completion"] == "score_supported_completed" and (not r["any_statistics_row"] or not r["any_roster_row"])],
+                                 coverage_differences=[r for r in coverage if r["season"] == 2026 and r["phase"] == "REG" and r["retrospective_result_observed"] and (not r["any_statistics_row"] or not r["any_roster_row"])],
+                                 coverage_differences_basis="retrospective_results_not_historical_completion",
                                  latest_completed_week_coverage=[r for r in coverage if r["season"] == 2026 and r["phase"] == "REG" and r["week"] == latest_week] if latest_week is not None else [],
                                  publication_evidence_missing=[aid for aid in SPECS if tables[aid].evidence.get("provider_publication_at") is None],
                                  publication_verification="caller_assertions_only_not_authenticated",
@@ -782,7 +829,8 @@ def inspect_rows(tables, *, as_of=None, participation_evidence=()):
                   findings=findings,
                   limitations=["CSV_only_no_Parquet_Arrow_Polars_or_nflreadpy_validation", "real_provider_completeness_not_established",
                                "roster_status_and_statistics_do_not_establish_game_day_participation", "no_hard_process_memory_limit",
-                               "completion_uses_scores_and_not_future_time_not_an_actual_start_or_final_whistle_record",
+                               "current_scores_and_undated_FINAL_status_do_not_establish_historical_completion",
+                               "explicit_player_namespaces_are_preserved_but_unresolved_without_a_verified_mapping",
                                "no_live_acquisition_or_database_access"])
     budget.retain(result)
     result["retained_content_accounting"] = dict(bytes=budget.counts["retained_bytes"], cap=LIMITS["retained_bytes"],

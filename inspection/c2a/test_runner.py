@@ -393,7 +393,91 @@ class InterpretationTests(unittest.TestCase):
         self.assertEqual(result["interpretations"]["cross_season_identifiers"]["stats_shared"], [P1])
         data = tables()
         replace_rows(data, "stats_2026", [stats(player_id="1", player_name="Same Name")])
-        self.assertIn("invalid_player_identifier", codes(report(data)))
+        result = report(data)
+        self.assertNotIn("invalid_player_identifier", codes(result))
+        self.assertIn("stats_identity_join_zero", codes(result))
+        self.assertEqual(candidates(result)[-1]["statistics_match_count"], 0)
+
+    def test_modern_and_legacy_ids_are_safe_opaque_strings(self):
+        for pid in (P1, "ABB498348", "0001", "1", "legacy:001"):
+            with self.subTest(pid=pid):
+                self.assertTrue(runner._identifier(pid))
+        self.assertIn("not_verified_GSIS", report()["player_identifier_semantics"])
+
+    def test_missing_null_blank_ids_rejected(self):
+        for pid in (None, "", "NA", "NULL", " ", "\t", 1):
+            with self.subTest(pid=pid):
+                self.assertFalse(runner._identifier(pid))
+
+    def test_unsafe_player_identifiers_rejected_without_normalization(self):
+        for pid in (" ABB498348", "ABB498348 ", "ABB 498348", "ABB\n498348", "ABB\r498348",
+                    "ABB\x00498348", "ABB\x1f498348", "ABB\x7f498348", "ABB\x85498348",
+                    "ABB\u202e498348", "ABB\ud800498348"):
+            with self.subTest(pid=repr(pid)):
+                self.assertFalse(runner._identifier(pid))
+
+    def test_legacy_identifier_exact_join(self):
+        data = tables()
+        replace_rows(data, "players", [dict(gsis_id="ABB498348")])
+        for year, week in ((2025, 1), (2026, 7)):
+            replace_rows(data, "stats_" + str(year), [stats(year, week, pid="ABB498348")])
+            replace_rows(data, "rosters_" + str(year), [roster(year, week, pid="ABB498348")])
+        result = report(data)
+        for item in candidates(result):
+            self.assertEqual(item["player_id"], "ABB498348")
+            self.assertEqual(item["player_game_key"], ["ABB498348", item["game_id"]])
+            self.assertEqual(item["identity_match_count"], 1)
+            self.assertEqual(item["statistics_match_count"], 1)
+        self.assertEqual(result["interpretations"]["cross_season_identifiers"]["stats_shared"], ["ABB498348"])
+        self.assertNotIn("invalid_player_identifier", codes(result))
+
+    def test_different_identifier_forms_never_become_equivalent(self):
+        for different in ("ABB-498348", "abb498348", "00-0000001", "1"):
+            with self.subTest(different=different):
+                data = tables()
+                replace_rows(data, "players", [dict(gsis_id="ABB498348", pfr_id=different)])
+                replace_rows(data, "stats_2026", [stats(pid=different)])
+                replace_rows(data, "rosters_2026", [roster(pid="ABB498348")])
+                result = report(data)
+                current = candidates(result)[-1]
+                self.assertEqual(current["statistics_match_count"], 0)
+                self.assertIn("stats_identity_join_zero", codes(result))
+
+    def test_duplicate_legacy_identity_stays_ambiguous(self):
+        data = tables()
+        replace_rows(data, "players", [dict(gsis_id="ABB498348"), dict(gsis_id="ABB498348")])
+        replace_rows(data, "stats_2026", [stats(pid="ABB498348")])
+        replace_rows(data, "rosters_2026", [roster(pid="ABB498348")])
+        current = candidates(report(data))[-1]
+        self.assertEqual(current["identity_match_count"], 2)
+        self.assertFalse(current["outcome_usable_retrospectively"])
+
+    def test_explicit_reference_namespace_is_preserved_and_unresolved(self):
+        data = tables()
+        replace_rows(data, "players", [dict(gsis_id=P1, gsis_id_namespace="other-source")])
+        result = report(data)
+        self.assertEqual(candidates(result)[-1]["identity_match_count"], 0)
+        self.assertIn("player_identifier_namespace_unresolved", codes(result))
+        declaration = next(f["declarations"] for f in result["findings"] if f["code"] == "player_identifier_namespace_unresolved")
+        self.assertEqual(declaration, {"gsis_id_namespace": "other-source"})
+
+    def test_explicit_statistics_namespace_cannot_join_default_source_ids(self):
+        data = tables()
+        replace_rows(data, "stats_2026", [stats(player_id_namespace="other-source")])
+        result = report(data)
+        self.assertEqual(candidates(result)[-1]["statistics_match_count"], 0)
+        self.assertEqual(result["interpretations"]["statistics_joins"][-1]["identity_match_count"], 0)
+        self.assertIn("player_identifier_namespace_unresolved", codes(result))
+
+    def test_explicit_roster_namespace_cannot_join_default_source_ids(self):
+        data = tables()
+        replace_rows(data, "rosters_2026", [roster(gsis_id_namespace="other-source")])
+        result = report(data)
+        current = candidates(result)[-1]
+        self.assertTrue(current["roster_designated_wr"])
+        self.assertIsNone(current["player_game_key"])
+        self.assertEqual(current["source_namespace_declarations"], {"gsis_id_namespace": "other-source"})
+        self.assertFalse(current["outcome_usable_retrospectively"])
 
     def test_duplicate_player_game_statistics_not_summed(self):
         data = tables()
@@ -539,8 +623,9 @@ class InterpretationTests(unittest.TestCase):
         result = report(data)
         freshness = result["freshness"]
         self.assertEqual(freshness["latest_observed_regular_season_week"], 18)
-        self.assertEqual(freshness["latest_fully_completed_observed_week"], 10)
-        self.assertEqual(freshness["latest_observed_completed_game"]["week"], 10)
+        self.assertIsNone(freshness["latest_fully_completed_observed_week"])
+        self.assertIsNone(freshness["latest_observed_completed_game"])
+        self.assertEqual(freshness["latest_retrospective_result_game"]["week"], 10)
         self.assertEqual(freshness["latest_receiving_statistics_week"], 10)
         self.assertEqual(freshness["latest_weekly_roster_week"], 10)
         self.assertEqual([c["week"] for c in candidates(result) if c["season"] == 2026], [7])
@@ -548,7 +633,10 @@ class InterpretationTests(unittest.TestCase):
     def test_partially_completed_week_not_fully_completed(self):
         data = tables()
         replace_rows(data, "schedules", [schedule(), schedule(week=10), schedule(week=10, away="OTH", game_id="unfinished", home_score="", away_score="")])
-        self.assertEqual(report(data)["freshness"]["latest_fully_completed_observed_week"], 7)
+        result = report(data)
+        self.assertIsNone(result["freshness"]["latest_fully_completed_observed_week"])
+        self.assertEqual(result["freshness"]["latest_completed_week_coverage"], [])
+        self.assertEqual(result["freshness"]["latest_retrospective_result_game"]["week"], 10)
 
     def test_future_game_with_scores_is_not_completed(self):
         data = tables()
@@ -581,6 +669,76 @@ class InterpretationTests(unittest.TestCase):
         data = tables()
         replace_rows(data, "schedules", [schedule(gameday="2026-11-11", kickoff_utc="2026-11-11T23:00:00Z")])
         self.assertIsNone(report(data)["freshness"]["latest_observed_completed_game"])
+
+    def test_as_of_before_kickoff_is_not_completed_despite_final_scores(self):
+        data = tables()
+        replace_rows(data, "schedules", [schedule(gameday="2026-11-08", kickoff_utc="2026-11-09T01:00:00Z", game_status="FINAL")])
+        result = report(data, as_of="2026-11-09T00:59:00Z")
+        game = result["interpretations"]["schedule_games"][0]
+        self.assertEqual(game["completion"], "future_game")
+        self.assertFalse(game["historical_completion_verified"])
+        self.assertTrue(game["retrospective_result_observed"])
+        self.assertIsNone(result["freshness"]["latest_observed_completed_game"])
+
+    def test_shortly_after_kickoff_cannot_use_subsequently_recorded_scores(self):
+        data = tables()
+        replace_rows(data, "schedules", [schedule(gameday="2026-11-08", kickoff_utc="2026-11-09T01:00:00Z")])
+        result = report(data, as_of="2026-11-09T01:01:00Z")
+        self.assertEqual(result["reference_as_of"], "2026-11-09T01:01:00Z")
+        self.assertEqual(result["interpretations"]["schedule_games"][0]["completion"], "retrospective_result_only")
+        self.assertIsNone(result["freshness"]["latest_observed_completed_game"])
+        self.assertEqual(len(result["freshness"]["retrospective_result_game_ids"]), 1)
+
+    def test_well_after_kickoff_still_has_no_verified_completion_time(self):
+        result = report()
+        self.assertTrue(all(not g["historical_completion_verified"] for g in result["interpretations"]["schedule_games"]))
+        self.assertIsNone(result["freshness"]["latest_observed_completed_game"])
+        self.assertIsNone(result["freshness"]["latest_fully_completed_observed_week"])
+        self.assertTrue(candidates(result)[-1]["outcome_usable_retrospectively"])
+
+    def test_final_status_without_publication_time_is_retrospective_only(self):
+        data = tables()
+        replace_rows(data, "schedules", [schedule(game_status="FINAL")])
+        result = report(data)
+        self.assertEqual(result["interpretations"]["schedule_games"][0]["completion"], "retrospective_result_only")
+        self.assertIsNone(result["freshness"]["latest_observed_completed_game"])
+
+    def test_unverified_completion_columns_do_not_create_evidence_contract(self):
+        data = tables()
+        replace_rows(data, "schedules", [schedule(game_status="FINAL", completed_at="2026-10-20T23:00:00Z", status_published_at="2026-10-20T23:01:00Z")])
+        result = report(data)
+        self.assertIsNone(result["freshness"]["latest_observed_completed_game"])
+        self.assertFalse(result["interpretations"]["schedule_games"][0]["historical_completion_verified"])
+
+    def test_missing_or_malformed_game_time_preserves_result_observations(self):
+        for extra in (dict(gametime=""), dict(gameday=""), dict(gametime="not-a-time"), dict(kickoff_utc="bad timestamp")):
+            with self.subTest(extra=extra):
+                data = tables()
+                replace_rows(data, "schedules", [schedule(**extra)])
+                result = report(data)
+                game = result["interpretations"]["schedule_games"][0]
+                self.assertEqual(game["completion"], "invalid_game_time")
+                self.assertTrue(game["retrospective_result_observed"])
+                self.assertIsNone(result["freshness"]["latest_observed_completed_game"])
+                self.assertEqual(result["freshness"]["retrospective_result_game_ids"], [schedule()["game_id"]])
+
+    def test_retrospective_result_coverage_survives_unknown_historical_completion(self):
+        data = tables()
+        replace_rows(data, "stats_2026", [])
+        result = report(data)
+        coverage = result["freshness"]["coverage_differences"]
+        self.assertTrue(coverage)
+        self.assertTrue(all(r["retrospective_result_observed"] for r in coverage))
+        self.assertTrue(all(not r["historical_completion_verified"] for r in coverage))
+        self.assertIsNone(result["freshness"]["latest_observed_completed_game"])
+
+    def test_future_scores_remain_source_observations_without_completion_claim(self):
+        data = tables()
+        replace_rows(data, "schedules", [schedule(gameday="2027-01-03")])
+        result = report(data)
+        self.assertTrue(result["interpretations"]["schedule_games"][0]["retrospective_result_observed"])
+        self.assertEqual(result["interpretations"]["schedule_games"][0]["completion"], "future_game")
+        self.assertIsNone(result["freshness"]["latest_retrospective_result_game"])
 
     def test_missing_publication_and_pregame_availability(self):
         result = report()
